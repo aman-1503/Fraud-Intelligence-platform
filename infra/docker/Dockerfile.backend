@@ -42,7 +42,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application code
 COPY app/ ./app/
-COPY models/ ./models/
+RUN mkdir -p ./models
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash appuser && \
