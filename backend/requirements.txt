@@ -7,8 +7,8 @@ httptools==0.6.1
 uvloop==0.19.0
 
 # Data validation
-pydantic==2.5.3
-pydantic-settings==2.1.0
+pydantic>=2.7.4,<3
+pydantic-settings>=2.1.0,<3
 
 # ML/Data Science
 numpy==1.26.3
@@ -47,3 +47,6 @@ mypy==1.8.0
 # Security
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+
+# Agentic investigation graph; deterministic provider needs no API key
+langgraph>=0.2.76,<0.3

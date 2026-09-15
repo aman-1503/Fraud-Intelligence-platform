@@ -8,6 +8,8 @@ import asyncio
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 import json
+import sqlite3
+from pathlib import Path
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -28,6 +30,7 @@ class Database:
         self._transactions: Dict[str, Dict] = {}
         self._users: Dict[str, Dict] = {}
         self._scores: Dict[str, Dict] = {}
+        self._case_db = None
     
     async def connect(self):
         """Establish database connection pool."""
@@ -42,6 +45,11 @@ class Database:
             # )
             
             self._connected = True
+            case_path = Path(settings.CASE_DB_PATH)
+            case_path.parent.mkdir(parents=True, exist_ok=True)
+            self._case_db = sqlite3.connect(case_path)
+            self._case_db.execute('CREATE TABLE IF NOT EXISTS investigation_cases (case_id TEXT PRIMARY KEY, transaction_id TEXT UNIQUE NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL)')
+            self._case_db.commit()
             logger.info("Database connected (in-memory mode)")
             
             # Initialize sample data
@@ -55,6 +63,9 @@ class Database:
         """Close database connection pool."""
         if self.pool:
             await self.pool.close()
+        if self._case_db:
+            self._case_db.close()
+            self._case_db = None
         self._connected = False
         logger.info("Database disconnected")
     
@@ -125,6 +136,26 @@ class Database:
     async def get_transaction(self, transaction_id: str) -> Optional[Dict]:
         """Get transaction by ID."""
         return self._transactions.get(transaction_id)
+
+    async def get_score(self, transaction_id: str) -> Optional[Dict]:
+        return self._scores.get(transaction_id)
+
+    async def save_case(self, case: Dict):
+        self._case_db.execute('INSERT INTO investigation_cases(case_id, transaction_id, status, payload) VALUES (?, ?, ?, ?) ON CONFLICT(case_id) DO UPDATE SET status=excluded.status, payload=excluded.payload',
+                              (case['case_id'], case['transaction_id'], case['status'], json.dumps(case, default=str)))
+        self._case_db.commit()
+
+    async def get_case(self, case_id: str) -> Optional[Dict]:
+        row = self._case_db.execute('SELECT payload FROM investigation_cases WHERE case_id=?', (case_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    async def get_case_for_transaction(self, transaction_id: str) -> Optional[Dict]:
+        row = self._case_db.execute('SELECT payload FROM investigation_cases WHERE transaction_id=?', (transaction_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    async def list_review_cases(self) -> List[Dict]:
+        rows = self._case_db.execute("SELECT payload FROM investigation_cases WHERE status='REVIEW_REQUIRED'").fetchall()
+        return [json.loads(row[0]) for row in rows]
     
     async def get_user_transactions(
         self, 
@@ -139,7 +170,7 @@ class Database:
         
         # Sort by timestamp descending
         user_txns.sort(
-            key=lambda x: x.get('timestamp', ''),
+            key=lambda x: str(x.get('timestamp') or ''),
             reverse=True
         )
         

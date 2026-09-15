@@ -1,17 +1,14 @@
 # Fraud Intelligence Platform - Docker Compose
 # Complete stack for local development and testing
 
-version: '3.8'
-
 services:
   # ==========================================
   # API Backend Service
   # ==========================================
   api:
     build:
-      context: ./backend
-      dockerfile: ../infra/docker/Dockerfile.backend
-    container_name: fraud-api
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
     ports:
       - "8000:8000"
     environment:
@@ -20,6 +17,11 @@ services:
       - MODEL_PATH=/app/models/fraud_model_v1
       - LOG_LEVEL=INFO
       - ENVIRONMENT=development
+      - CASE_DB_PATH=/app/cases/cases.sqlite3
+      - ARCHIVE_PATH=/app/models/ulb_real
+      - INVESTIGATION_PROVIDER=${INVESTIGATION_PROVIDER:-deterministic}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1-mini}
     depends_on:
       postgres:
         condition: service_healthy
@@ -27,6 +29,7 @@ services:
         condition: service_healthy
     volumes:
       - ./ml/models:/app/models:ro
+      - fraud-cases:/app/cases
     networks:
       - fraud-network
     healthcheck:
@@ -49,7 +52,6 @@ services:
   # ==========================================
   postgres:
     image: postgres:15-alpine
-    container_name: fraud-postgres
     ports:
       - "5432:5432"
     environment:
@@ -77,7 +79,6 @@ services:
   # ==========================================
   redis:
     image: redis:7-alpine
-    container_name: fraud-redis
     ports:
       - "6379:6379"
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
@@ -101,12 +102,11 @@ services:
   # ==========================================
   frontend:
     image: node:20-alpine
-    container_name: fraud-frontend
     working_dir: /app
     ports:
       - "3000:3000"
     environment:
-      - VITE_API_URL=http://localhost:8000
+      - VITE_API_URL=http://api:8000
     volumes:
       - ./frontend:/app
       - /app/node_modules
@@ -121,7 +121,6 @@ services:
   # ==========================================
   prometheus:
     image: prom/prometheus:latest
-    container_name: fraud-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -141,7 +140,6 @@ services:
   # ==========================================
   grafana:
     image: grafana/grafana:latest
-    container_name: fraud-grafana
     ports:
       - "3001:3000"
     environment:
@@ -161,7 +159,6 @@ services:
   # ==========================================
   locust:
     image: locustio/locust:latest
-    container_name: fraud-locust
     ports:
       - "8089:8089"
     volumes:
@@ -189,3 +186,4 @@ volumes:
   redis-data:
   prometheus-data:
   grafana-data:
+  fraud-cases:

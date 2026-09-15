@@ -1,318 +1,111 @@
-# 🛡️ Cloud-Native Distributed Fraud Intelligence Platform
+# Agentic Fraud Intelligence Platform MVP
 
-Real-time fraud detection platform achieving **sub-150ms latency** and handling **3,000+ requests per second** with XGBoost ML pipeline.
+A FastAPI fraud-scoring API with a separate LangGraph investigation workflow and human-review case endpoints. The immediate score and the investigation recommendation are separate decisions.
 
-![Python](https://img.shields.io/badge/Python-3.11-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green)
-![XGBoost](https://img.shields.io/badge/XGBoost-2.0-orange)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-blue)
-![Redis](https://img.shields.io/badge/Redis-7-red)
-![Docker](https://img.shields.io/badge/Docker-Ready-blue)
-
-## 🎯 Key Features
-
-| Feature | Specification |
-|---------|--------------|
-| **Latency** | Sub-150ms P99 fraud scoring |
-| **Throughput** | 3,000+ RPS validated under load |
-| **ML Model** | XGBoost with 96.7% AUC |
-| **Real-time** | Live feature extraction & velocity tracking |
-| **Scalable** | Horizontal scaling with Kubernetes |
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         API GATEWAY                             │
-│                    (FastAPI + Uvicorn)                          │
-│              Rate Limiting │ Auth │ Load Balancing              │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-            ┌───────────────┼───────────────┐
-            ▼               ▼               ▼
-    ┌───────────┐   ┌───────────┐   ┌───────────┐
-    │  Feature  │   │    ML     │   │ Decision  │
-    │  Engine   │──▶│  Pipeline │──▶│  Engine   │
-    └───────────┘   └───────────┘   └───────────┘
-            │               │               │
-            └───────────────┼───────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-   ┌─────────┐        ┌──────────┐        ┌─────────┐
-   │  Redis  │        │PostgreSQL│        │ Message │
-   │  Cache  │        │    DB    │        │  Queue  │
-   └─────────┘        └──────────┘        └─────────┘
+```mermaid
+flowchart LR
+  T[Transaction] --> API[FastAPI /score]
+  API --> F[Feature engineering]
+  F --> X[XGBoost model when artifact exists]
+  F --> R[Explicit rules-only local fallback]
+  X --> S[Immediate fraud score]
+  R --> S
+  S --> D[(Stored transaction and score)]
+  D --> I[Start investigation endpoint]
+  I --> G[LangGraph: triage → evidence → investigation]
+  G --> Q[Deterministic or optional OpenAI recommendation]
+  Q --> V[Validate action and evidence citations]
+  V --> C[(SQLite case and review status)]
+  C --> H[Human review API]
+  O[OpenML ULB 2013 archive] --> B[Time-ordered XGBoost benchmark]
+  B --> A[(Held-out replay rows and measured metrics)]
+  A --> UI[Frontend historical replay]
+  M[mempool.space public Bitcoin API] --> P[10-second cached live API proxy]
+  P --> L[Frontend live Bitcoin activity]
 ```
 
-## 🚀 Quick Start
+## What works
 
-### Prerequisites
-- Docker & Docker Compose
-- Python 3.11+ (for local development)
-- Node.js 18+ (for frontend)
+- `POST /api/v1/score` immediately returns a score and stores the transaction in the repository's existing data adapter. XGBoost scoring remains separate from asynchronous agentic investigation; **no LLM/provider call runs in the scoring request path**.
+- `POST /api/v1/investigations/{transaction_id}` schedules a background LangGraph workflow for an already scored transaction. Triage uses a configurable score threshold (`INVESTIGATION_SCORE_THRESHOLD`, default `0.6`), risk level, and risk factors. Low-risk cases skip the provider.
+- Evidence tools read a stored profile and earlier transactions through the existing `Database` and `RedisCache` interfaces. Missing data is marked `insufficient_evidence`; the workflow never creates historical transactions. Recommendations cite IDs of retrieved evidence.
+- Each investigation returns a deterministic `evidence.gaps` brief: missing recent history, amount baseline, device baseline, or country baseline, with a specific analyst check for each. It lists only signals the repository could not retrieve; it does not claim the suggested check was performed. This helps reviewers see what would make the case more reliable instead of relying on a score alone.
+- The investigation node can call OpenAI's Responses API with strict structured JSON output when `INVESTIGATION_PROVIDER=openai` and `OPENAI_API_KEY` are set. It receives the score, deterministic rule, transaction amount/country/category, and retrieved evidence with temporary aliases instead of raw account IDs. Its recommendation is checked against the evidence IDs actually retrieved. Default mode is deterministic and needs no key. If the model is unavailable, deterministic fallback is recorded and requires human review; invalid output fails validation and marks the case `FAILED`.
+- Local recommendation confidence values are rule-assigned and uncalibrated; they are not measured model accuracy.
+- Cases require human review for low confidence (`HUMAN_REVIEW_CONFIDENCE_THRESHOLD`, default `0.7`), insufficient evidence, rules/recommendation disagreement, `BLOCK`, or model fallback. Saved `review_reasons` names each trigger. A case also reports `investigation_mode` (`openai` or `deterministic`) and `provider_fallback`; model confidence is self-reported, not calibrated.
+- Case and reviewer decisions are saved in a local SQLite file (`CASE_DB_PATH`, default `cases.sqlite3` relative to the backend working directory). They remain available after an API restart.
+- A separate real-world benchmark uses anonymized ULB/Worldline card transactions from September 2013, downloaded from [OpenML dataset 1597](https://www.openml.org/data/v1/download/1673544/creditcard.arff). A time-ordered XGBoost train/validation/test split creates a held-out replay and measured metrics. The frontend now shows these recorded rows rather than random statistics. This is **historical data, not a live payment feed**.
+- A separate live tab retrieves the latest unconfirmed Bitcoin mainnet transactions from the [mempool.space public REST API](https://mempool.space/docs/api/rest) through a 10-second cached FastAPI proxy. The source returns only its latest **10** transactions per request; while the tab is open, the browser retains up to 100 distinct IDs across polls. “First seen” is the browser’s observation time, not a transaction creation time, and polling can miss intervening transactions. The tab displays only source-provided IDs, fees, sizes, and values. These records are real and current, but they are **not card payments and carry no fraud labels**; the card-fraud scorer and investigation do not process them.
 
-### 1. Clone and Setup
+The local benchmark run used 199,364 training rows, 42,721 validation rows, and 42,722 test rows (52 labeled fraud). On that test portion it measured average precision `0.7626`, ROC-AUC `0.9827`, precision `0.8810`, and recall `0.7115` at a threshold chosen on validation. These are archive-specific results, not performance claims for the original `/score` API or future live payments.
+
+## Run locally
+
+Use Python 3.11 and Node 20. From the repository root:
 
 ```bash
-cd fraud-platform
-
-# Create model directory
-mkdir -p ml/models/fraud_model_v1
-
-# Train the model (creates sample model)
-cd ml && python train.py --sample && cd ..
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+cd backend
+DEBUG=false uvicorn app.main:app --reload --port 8000
 ```
 
-### 2. Start with Docker Compose
+To build the real-world archive without an account or API key, from the repository root:
 
 ```bash
-# Start all services
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f api
+mkdir -p ml/data
+curl -L --fail https://www.openml.org/data/v1/download/1673544/creditcard.arff -o ml/data/creditcard.arff
+cd ml && python train_real.py && cd ..
 ```
 
-### 3. Access Services
+Then run `cd frontend && npm ci && npm run dev` in a second terminal. API docs are at `http://localhost:8000/docs`; the two data tabs are at `http://localhost:3000`. The live endpoint is `GET /api/v1/live/bitcoin/recent`; archive endpoints are `GET /api/v1/archive/metadata` and `GET /api/v1/archive/rows?after=-1&limit=20`. For the original transaction-scoring API, an optional synthetic sample artifact can be produced with `cd ml && python train.py --sample`; set `MODEL_PATH` to that output. Without an artifact, `/score` reports `rules-only` and uses deterministic rules. The archive's XGBoost model is separate because its anonymized columns do not match the `/score` transaction schema.
 
-| Service | URL | Description |
-|---------|-----|-------------|
-| **API** | http://localhost:8000 | Fraud scoring API |
-| **API Docs** | http://localhost:8000/docs | Interactive API docs |
-| **Frontend** | http://localhost:3000 | React dashboard |
-| **Grafana** | http://localhost:3001 | Monitoring dashboards |
-| **Prometheus** | http://localhost:9090 | Metrics |
+To use a real model for flagged investigations, set `INVESTIGATION_PROVIDER=openai`, `OPENAI_API_KEY` to your own API key, and optionally `OPENAI_MODEL` (default `gpt-4.1-mini`) before starting the API. For Docker, put these in an ignored root `.env` or export them before `docker compose up`. [Responses API structured-output documentation](https://platform.openai.com/docs/api-reference/responses/create). Without a key the workflow still runs locally in deterministic mode; an explicit `openai` mode with an unavailable key records fallback. Do not send real cardholder data until the integration has privacy and access controls.
 
-## 📊 API Usage
+The archive table fetches 20 rows per page from 42,722 held-out rows. Use **Load next 20**, **Play replay**, or **Show known fraud only**; the table keeps the latest 100 displayed to stay responsive.
 
-### Score a Transaction
+Docker Compose defines API, PostgreSQL, Redis, frontend, Prometheus, and Grafana services: after `train_real.py`, run `docker compose up --build -d`. Compose mounts the archive artifact read-only and a named volume for the SQLite case file. The current `Database` and `RedisCache` Python adapters still use in-memory dictionaries for transactions, profiles, and cache entries.
+
+## Example
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/score \
-  -H "Content-Type: application/json" \
-  -d '{
-    "transaction_id": "TXN-12345",
-    "user_id": "U000001",
-    "amount": 150.00,
-    "merchant_category": "electronics",
-    "country": "US",
-    "device_id": "device_001"
-  }'
+curl -s -X POST http://localhost:8000/api/v1/score \
+  -H 'Content-Type: application/json' \
+  -d '{"transaction_id":"TXN-1","user_id":"U000001","amount":5000,"merchant_category":"crypto_exchange","country":"NG","device_id":"new-device"}'
+curl -s -X POST http://localhost:8000/api/v1/investigations/TXN-1
+curl -s http://localhost:8000/api/v1/investigations/<case_id>
+curl -s http://localhost:8000/api/v1/review/cases
+curl -s -X POST http://localhost:8000/api/v1/review/cases/<case_id> \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewer":"analyst-1","final_action":"REQUEST_VERIFICATION","note":"Verify customer identity"}'
 ```
 
-### Response
+The start endpoint returns `PENDING`; retrieve the case by its returned `case_id`. A result has this shape (values depend on the stored transaction and evidence):
 
 ```json
 {
-  "transaction_id": "TXN-12345",
-  "fraud_score": 0.15,
-  "risk_level": "LOW",
-  "decision": "APPROVE",
-  "confidence": 0.92,
-  "latency_ms": 42.5,
-  "risk_factors": [],
-  "model_version": "v1.0.0",
-  "scored_at": "2024-01-15T10:30:00Z"
+  "recommended_action": "BLOCK",
+  "confidence": 0.88,
+  "risk_summary": "Critical score with at least two corroborating account, device, location, or velocity anomalies.",
+  "evidence_ids": ["score:TXN-1", "profile:U000001:amount", "profile:U000001:country"],
+  "requires_human_review": true
 }
 ```
 
-### Batch Scoring
+For a new account with no stored profile or history, `evidence.gaps` includes records such as `{"signal":"RECENT_HISTORY","reason":"No earlier transactions are stored for this account.","next_check":"Check permitted payment history before deciding whether this is a new pattern."}`. The case requires review because evidence is insufficient.
+
+`GET /api/v1/review/cases` lists review-required cases. `POST /api/v1/review/cases/{case_id}` stores a reviewer's final action and note, including an override. `GET /api/v1/investigations/{case_id}` returns the saved final status.
+
+## Tests
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/score/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "transactions": [
-      {"transaction_id": "TXN-001", "user_id": "U000001", "amount": 50.00, "merchant_category": "grocery", "country": "US"},
-      {"transaction_id": "TXN-002", "user_id": "U000002", "amount": 500.00, "merchant_category": "electronics", "country": "UK"}
-    ]
-  }'
-```
-
-## 🧪 Load Testing
-
-Run load tests to validate performance:
-
-```bash
-# Start Locust
-docker-compose --profile testing up locust
-
-# Access Locust UI
-open http://localhost:8089
-```
-
-Or run headless:
-
-```bash
-docker-compose run locust \
-  -f /mnt/locust/locustfile.py \
-  --host=http://api:8000 \
-  --headless \
-  -u 500 \
-  -r 50 \
-  -t 60s
-```
-
-**Expected Results:**
-- Median latency: <50ms
-- P99 latency: <150ms
-- Throughput: >3,000 RPS
-
-## 🤖 ML Pipeline
-
-### Features
-
-| Category | Features |
-|----------|----------|
-| **Transaction** | amount, amount_log, hour, day_of_week, is_weekend |
-| **Merchant** | risk_score, is_high_risk, is_cash_equivalent |
-| **Velocity** | txn_count_1h/6h/24h, amount_sum_1h/24h |
-| **Behavioral** | amount_zscore, deviation_from_avg |
-| **Geographic** | is_foreign, country_risk, distance_from_home |
-| **Device** | is_new_device, device_age, device_risk |
-
-### Model Performance
-
-| Metric | Value |
-|--------|-------|
-| ROC-AUC | 0.967 |
-| PR-AUC | 0.854 |
-| Precision | 94.2% |
-| Recall | 89.7% |
-| F1 Score | 91.9% |
-
-### Retrain Model
-
-```bash
-# Generate synthetic dataset
-cd ml
-python generate_dataset.py
-
-# Train model
-python train.py
-
-# Model saved to ml/models/fraud_model_v1/
-```
-
-## 📁 Project Structure
-
-```
-fraud-platform/
-├── ml/                          # Machine Learning
-│   ├── data/                    # Datasets
-│   ├── models/                  # Trained models
-│   ├── generate_dataset.py      # Synthetic data generation
-│   ├── features.py              # Feature engineering
-│   └── train.py                 # Model training
-├── backend/                     # FastAPI Backend
-│   ├── app/
-│   │   ├── api/                 # API routes
-│   │   ├── core/                # Config, logging
-│   │   ├── ml/                  # ML inference
-│   │   ├── db/                  # Database layer
-│   │   └── main.py              # Application entry
-│   └── requirements.txt
-├── frontend/                    # React Dashboard
-│   └── src/
-│       └── FraudDashboard.jsx
-├── infra/                       # Infrastructure
-│   ├── docker/                  # Dockerfiles
-│   ├── k8s/                     # Kubernetes configs
-│   ├── prometheus/              # Monitoring
-│   └── grafana/                 # Dashboards
-├── load-tests/                  # Performance tests
-│   └── locustfile.py
-├── docker-compose.yml
-└── README.md
-```
-
-## 🔧 Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `postgresql+asyncpg://...` | PostgreSQL connection |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
-| `MODEL_PATH` | `models/fraud_model_v1` | Model directory |
-| `LOG_LEVEL` | `INFO` | Logging level |
-| `TARGET_LATENCY_MS` | `150` | SLA target |
-
-### Fraud Thresholds
-
-| Risk Level | Score Range | Decision |
-|------------|-------------|----------|
-| LOW | 0.0 - 0.3 | APPROVE |
-| MEDIUM | 0.3 - 0.6 | APPROVE (monitor) |
-| HIGH | 0.6 - 0.85 | REVIEW |
-| CRITICAL | 0.85 - 1.0 | DECLINE |
-
-## 📈 Monitoring
-
-### Grafana Dashboards
-
-1. **Fraud Overview** - Real-time fraud metrics
-2. **API Performance** - Latency and throughput
-3. **Model Performance** - Score distributions, drift detection
-
-### Key Metrics
-
-- `fraud_scoring_latency_seconds` - Scoring latency histogram
-- `fraud_scoring_total` - Total predictions counter
-- `fraud_score_distribution` - Score distribution
-- `cache_hit_rate` - Redis cache effectiveness
-
-## 🔒 Security
-
-- API key authentication
-- Rate limiting (1000 req/min default)
-- Input validation with Pydantic
-- SQL injection prevention
-- CORS configuration
-
-## 🛠️ Development
-
-### Local Setup
-
-```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
 cd backend
-pip install -r requirements.txt
-
-# Run locally
-uvicorn app.main:app --reload --port 8000
+DEBUG=false pytest tests -q
 ```
 
-### Run Tests
+The suite covers scorer/API behavior, graph triage, evidence gaps and missing timestamps, insufficient evidence, low confidence, mocked OpenAI structured responses and fabricated-citation rejection, provider fallback, saved human override, archive cursor/API behavior, and live upstream validation/failure. Frontend build: `cd frontend && npm run build`.
 
-```bash
-# Unit tests
-pytest tests/ -v
+## Current limits
 
-# With coverage
-pytest tests/ --cov=app --cov-report=html
-```
-
-## 📄 License
-
-MIT License - see LICENSE file for details.
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests
-5. Submit a pull request
-
----
-
-Built with ❤️ for real-time fraud detection at scale.
+This is a local MVP, not a deployed decisioning system. The live Bitcoin feed can fail or be rate-limited by its public upstream and has no confirmed fraud outcomes. The ULB archive has real labels but only `Time`, `Amount`, and anonymized `V1–V28`; it provides no stable customer, device, merchant, or country evidence. Neither source can serve as a live pre-payment **card** fraud feed or run the existing evidence investigation for its missing fields. Transactions and user profiles in the original API remain process-local; only case/review records are saved to SQLite. There is no authenticated reviewer role, payment-company integration, email alert, or live OpenAI call verified without a credential. PostgreSQL and Redis containers exist in the Docker stack but the Python adapters do not yet connect to them. Benchmark model scores are not calibrated probabilities; use a real payment source and domain-specific validation before making real decisions.

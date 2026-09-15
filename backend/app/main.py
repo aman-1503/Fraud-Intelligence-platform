@@ -17,18 +17,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import httpx
 
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.ml.scorer import FraudScorer
 from app.db.database import Database
 from app.db.redis_cache import RedisCache
+from app.investigation.models import Case, InvestigationResult, Action
+from app.investigation.workflow import InvestigationWorkflow
+from app.archive.repository import ArchiveRepository
+from app.live.bitcoin import LiveBitcoinFeed, BitcoinFeedResult
 
 
 # Global instances
 fraud_scorer: Optional[FraudScorer] = None
 database: Optional[Database] = None
 redis_cache: Optional[RedisCache] = None
+live_bitcoin_feed = LiveBitcoinFeed()
 
 
 @asynccontextmanager
@@ -207,6 +213,49 @@ class BatchResponse(BaseModel):
     total_latency_ms: float
 
 
+class ReviewRequest(BaseModel):
+    reviewer: str = Field(min_length=1)
+    final_action: Action
+    note: str = Field(min_length=1)
+
+
+def get_archive() -> ArchiveRepository:
+    archive = ArchiveRepository(settings.ARCHIVE_PATH)
+    if not archive.available():
+        raise HTTPException(status_code=503, detail="Real-world archive unavailable; run ml/train_real.py")
+    return archive
+
+
+@app.get("/api/v1/archive/metadata", tags=["Real-world archive"])
+async def archive_metadata(archive: ArchiveRepository = Depends(get_archive)):
+    """Measured holdout metrics and source provenance; historical data, not a live feed."""
+    return archive.metadata()
+
+
+@app.get("/api/v1/archive/rows", tags=["Real-world archive"])
+async def archive_rows(after: int = -1, limit: int = 20, known_fraud_only: bool = False,
+                       archive: ArchiveRepository = Depends(get_archive)):
+    """Replay held-out rows in their original time order without invented enrichment."""
+    try:
+        return archive.rows(after, limit, known_fraud_only)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+def get_live_bitcoin_feed() -> LiveBitcoinFeed:
+    return live_bitcoin_feed
+
+
+@app.get("/api/v1/live/bitcoin/recent", response_model=BitcoinFeedResult, tags=["Live public data"])
+async def recent_bitcoin_transactions(feed: LiveBitcoinFeed = Depends(get_live_bitcoin_feed)):
+    """Live unconfirmed Bitcoin activity; these transactions are not fraud-labeled."""
+    try:
+        return await feed.recent()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Public Bitcoin source unavailable: %s", exc)
+        raise HTTPException(status_code=502, detail="Public Bitcoin feed unavailable")
+
+
 # API Endpoints
 @app.post("/api/v1/score", response_model=FraudScore, tags=["Scoring"])
 async def score_transaction(
@@ -329,6 +378,64 @@ async def get_transaction(
     if not result:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return result
+
+
+async def _run_investigation(case_id: str, db: Database, cache: RedisCache):
+    case = await db.get_case(case_id)
+    transaction = await db.get_transaction(case['transaction_id'])
+    score = await db.get_score(case['transaction_id'])
+    try:
+        state = await InvestigationWorkflow(db, cache).run(transaction, score)
+        case.update(triage=state['triage'], evidence=state['evidence'], result=state['result'],
+                    investigation_mode=state['investigation_mode'], provider_fallback=state['provider_fallback'],
+                    review_reasons=state['review_reasons'],
+                    status='REVIEW_REQUIRED' if state['result']['requires_human_review'] else 'COMPLETE')
+    except Exception as exc:
+        logger.exception("Investigation failed for %s", case_id)
+        case.update(status='FAILED', error=str(exc))
+    await db.save_case(case)
+
+
+@app.post("/api/v1/investigations/{transaction_id}", response_model=Case, tags=["Investigations"])
+async def start_investigation(transaction_id: str, background_tasks: BackgroundTasks,
+                              db: Database = Depends(get_database), cache: RedisCache = Depends(get_cache)):
+    """Start an investigation for an already scored transaction; scoring stays independent."""
+    existing = await db.get_case_for_transaction(transaction_id)
+    if existing:
+        return Case.model_validate(existing)
+    transaction, score = await db.get_transaction(transaction_id), await db.get_score(transaction_id)
+    if not transaction or not score:
+        raise HTTPException(status_code=404, detail="Scored transaction not found")
+    case = Case(case_id=str(uuid.uuid4()), transaction_id=transaction_id, status='PENDING')
+    await db.save_case(case.model_dump())
+    background_tasks.add_task(_run_investigation, case.case_id, db, cache)
+    return case
+
+
+@app.get("/api/v1/investigations/{case_id}", response_model=Case, tags=["Investigations"])
+async def get_investigation(case_id: str, db: Database = Depends(get_database)):
+    case = await db.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return Case.model_validate(case)
+
+
+@app.get("/api/v1/review/cases", response_model=list[Case], tags=["Review"])
+async def list_review_cases(db: Database = Depends(get_database)):
+    return [Case.model_validate(case) for case in await db.list_review_cases()]
+
+
+@app.post("/api/v1/review/cases/{case_id}", response_model=Case, tags=["Review"])
+async def review_case(case_id: str, review: ReviewRequest, db: Database = Depends(get_database)):
+    case = await db.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    if case['status'] != 'REVIEW_REQUIRED':
+        raise HTTPException(status_code=409, detail="Case does not require review")
+    case.update(status='REVIEWED', final_action=review.final_action, reviewer=review.reviewer,
+                review_note=review.note)
+    await db.save_case(case)
+    return Case.model_validate(case)
 
 
 @app.get("/api/v1/user/{user_id}/profile", tags=["Users"])

@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # ML Model
     MODEL_PATH: str = "models/fraud_model_v1"
     MODEL_VERSION: str = "v1.0.0"
+
+    # Agentic investigation (never used in the scoring request path)
+    INVESTIGATION_SCORE_THRESHOLD: float = 0.6
+    HUMAN_REVIEW_CONFIDENCE_THRESHOLD: float = 0.7
+    INVESTIGATION_PROVIDER: str = "deterministic"  # deterministic or openai
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4.1-mini"
+    OPENAI_TIMEOUT_SECONDS: float = 20.0
+    CASE_DB_PATH: str = "cases.sqlite3"
+    ARCHIVE_PATH: str = "../ml/models/ulb_real"
     
     # Fraud thresholds
     THRESHOLD_LOW: float = 0.3
