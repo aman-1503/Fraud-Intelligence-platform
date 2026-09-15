@@ -235,6 +235,17 @@ def test_human_override_and_saved_status(tmp_path, monkeypatch):
     assert asyncio.run(reopened())['final_action'] == 'REQUEST_VERIFICATION'
 
 
+def test_provider_status_does_not_expose_credential(monkeypatch):
+    monkeypatch.setattr(settings, 'INVESTIGATION_PROVIDER', 'openai')
+    monkeypatch.setattr(settings, 'OPENAI_API_KEY', 'test-secret-value')
+    with TestClient(app) as client:
+        response = client.get('/api/v1/investigations/provider-status')
+    assert response.status_code == 200
+    assert response.json()['llm_configured'] is True
+    assert response.json()['model'] == settings.OPENAI_MODEL
+    assert 'test-secret-value' not in response.text
+
+
 @pytest.mark.asyncio
 async def test_exported_xgboost_artifact_used_for_immediate_score(tmp_path, monkeypatch):
     names = FeatureExtractor.FEATURE_NAMES[:30]

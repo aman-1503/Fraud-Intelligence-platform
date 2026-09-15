@@ -20,8 +20,9 @@ flowchart LR
   O[OpenML ULB 2013 archive] --> B[Time-ordered XGBoost benchmark]
   B --> A[(Held-out replay rows and measured metrics)]
   A --> UI[Frontend historical replay]
-  M[mempool.space public Bitcoin API] --> P[10-second cached live API proxy]
+  M[mempool.space public Bitcoin REST API] --> P[10-second cached live API proxy]
   P --> L[Frontend live Bitcoin activity]
+  W[mempool.space WebSocket ID stream] --> L
 ```
 
 ## What works
@@ -35,7 +36,8 @@ flowchart LR
 - Cases require human review for low confidence (`HUMAN_REVIEW_CONFIDENCE_THRESHOLD`, default `0.7`), insufficient evidence, rules/recommendation disagreement, `BLOCK`, or model fallback. Saved `review_reasons` names each trigger. A case also reports `investigation_mode` (`openai` or `deterministic`) and `provider_fallback`; model confidence is self-reported, not calibrated.
 - Case and reviewer decisions are saved in a local SQLite file (`CASE_DB_PATH`, default `cases.sqlite3` relative to the backend working directory). They remain available after an API restart.
 - A separate real-world benchmark uses anonymized ULB/Worldline card transactions from September 2013, downloaded from [OpenML dataset 1597](https://www.openml.org/data/v1/download/1673544/creditcard.arff). A time-ordered XGBoost train/validation/test split creates a held-out replay and measured metrics. The frontend now shows these recorded rows rather than random statistics. This is **historical data, not a live payment feed**.
-- A separate live tab retrieves the latest unconfirmed Bitcoin mainnet transactions from the [mempool.space public REST API](https://mempool.space/docs/api/rest) through a 10-second cached FastAPI proxy. The source returns only its latest **10** transactions per request; while the tab is open, the browser retains up to 100 distinct IDs across polls. “First seen” is the browser’s observation time, not a transaction creation time, and polling can miss intervening transactions. The tab displays only source-provided IDs, fees, sizes, and values. These records are real and current, but they are **not card payments and carry no fraud labels**; the card-fraud scorer and investigation do not process them.
+- A separate live tab combines the latest **10** unconfirmed Bitcoin mainnet transactions with fee/size/value from the [mempool.space REST API](https://mempool.space/docs/api/rest) and a [low-bandwidth WebSocket stream](https://mempool.space/docs/api/websocket) of newly added transaction IDs. While open, the browser displays up to **500** distinct IDs. Stream-only IDs have no fee/size/value until seen in a REST snapshot or fetched individually with **Load details** (`GET /api/v1/live/bitcoin/tx/{txid}`); details are never fetched automatically for hundreds of IDs. “First seen” is the browser’s observation time, and disconnects can miss events. These are **not card payments and carry no fraud labels**; the card-fraud scorer and investigator do not process them.
+- The frontend's **Investigate a transaction** tab exposes the submitted-card API flow, provider configuration (`GET /api/v1/investigations/provider-status`), saved evidence and gaps, actual `openai`/`deterministic` case mode, review reasons, and a human review form. It does not fabricate a live card feed or expose the API key.
 
 The local benchmark run used 199,364 training rows, 42,721 validation rows, and 42,722 test rows (52 labeled fraud). On that test portion it measured average precision `0.7626`, ROC-AUC `0.9827`, precision `0.8810`, and recall `0.7115` at a threshold chosen on validation. These are archive-specific results, not performance claims for the original `/score` API or future live payments.
 
@@ -59,7 +61,7 @@ curl -L --fail https://www.openml.org/data/v1/download/1673544/creditcard.arff -
 cd ml && python train_real.py && cd ..
 ```
 
-Then run `cd frontend && npm ci && npm run dev` in a second terminal. API docs are at `http://localhost:8000/docs`; the two data tabs are at `http://localhost:3000`. The live endpoint is `GET /api/v1/live/bitcoin/recent`; archive endpoints are `GET /api/v1/archive/metadata` and `GET /api/v1/archive/rows?after=-1&limit=20`. For the original transaction-scoring API, an optional synthetic sample artifact can be produced with `cd ml && python train.py --sample`; set `MODEL_PATH` to that output. Without an artifact, `/score` reports `rules-only` and uses deterministic rules. The archive's XGBoost model is separate because its anonymized columns do not match the `/score` transaction schema.
+Then run `cd frontend && npm ci && npm run dev` in a second terminal. API docs are at `http://localhost:8000/docs`; the three tabs are at `http://localhost:3000`. The live REST endpoint is `GET /api/v1/live/bitcoin/recent`; archive endpoints are `GET /api/v1/archive/metadata` and `GET /api/v1/archive/rows?after=-1&limit=20`. For the original transaction-scoring API, an optional synthetic sample artifact can be produced with `cd ml && python train.py --sample`; set `MODEL_PATH` to that output. Without an artifact, `/score` reports `rules-only` and uses deterministic rules. The archive's XGBoost model is separate because its anonymized columns do not match the `/score` transaction schema.
 
 To use a real model for flagged investigations, set `INVESTIGATION_PROVIDER=openai`, `OPENAI_API_KEY` to your own API key, and optionally `OPENAI_MODEL` (default `gpt-4.1-mini`) before starting the API. For Docker, put these in an ignored root `.env` or export them before `docker compose up`. [Responses API structured-output documentation](https://platform.openai.com/docs/api-reference/responses/create). Without a key the workflow still runs locally in deterministic mode; an explicit `openai` mode with an unavailable key records fallback. Do not send real cardholder data until the integration has privacy and access controls.
 
@@ -104,7 +106,7 @@ cd backend
 DEBUG=false pytest tests -q
 ```
 
-The suite covers scorer/API behavior, graph triage, evidence gaps and missing timestamps, insufficient evidence, low confidence, mocked OpenAI structured responses and fabricated-citation rejection, provider fallback, saved human override, archive cursor/API behavior, and live upstream validation/failure. Frontend build: `cd frontend && npm run build`.
+The suite covers scorer/API behavior, graph triage, evidence gaps and missing timestamps, insufficient evidence, low confidence, mocked OpenAI structured responses and fabricated-citation rejection, provider fallback, saved human override, archive cursor/API behavior, and live upstream validation/failure. Frontend WebSocket ID parsing and accumulation: `cd frontend && npm test`; build: `npm run build`.
 
 ## Current limits
 

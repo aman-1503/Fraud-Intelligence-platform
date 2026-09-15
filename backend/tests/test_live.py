@@ -57,3 +57,40 @@ def test_live_endpoint_and_upstream_failure():
         assert response.json()['detail'] == 'Public Bitcoin feed unavailable'
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_selected_transaction_detail_is_source_derived_and_cached():
+    calls = 0
+    async def detail_fetch(txid):
+        nonlocal calls
+        calls += 1
+        return {'txid': txid, 'fee': 123, 'weight': 561,
+                'vout': [{'value': 200}, {'value': 300}], 'status': {'confirmed': True}}
+    feed = LiveBitcoinFeed(detail_fetcher=detail_fetch)
+    first = await feed.detail('b' * 64)
+    second = await feed.detail('b' * 64)
+    assert calls == 1
+    assert first == second
+    assert first.value == 500
+    assert first.vsize == 141
+    assert first.confirmed is True
+    with pytest.raises(ValueError):
+        await feed.detail('invalid-id')
+    assert calls == 1
+
+
+def test_selected_transaction_detail_endpoint_validates_id():
+    async def detail_fetch(txid):
+        return {'txid': txid, 'fee': 50, 'weight': 400,
+                'vout': [{'value': 900}], 'status': {'confirmed': False}}
+    app.dependency_overrides[get_live_bitcoin_feed] = lambda: LiveBitcoinFeed(detail_fetcher=detail_fetch)
+    try:
+        with TestClient(app) as client:
+            valid = client.get('/api/v1/live/bitcoin/tx/' + 'c' * 64)
+            invalid = client.get('/api/v1/live/bitcoin/tx/not-a-txid')
+        assert valid.status_code == 200
+        assert valid.json()['value'] == 900
+        assert invalid.status_code == 422
+    finally:
+        app.dependency_overrides.clear()

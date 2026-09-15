@@ -15,7 +15,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 import httpx
 
@@ -27,7 +27,7 @@ from app.db.redis_cache import RedisCache
 from app.investigation.models import Case, InvestigationResult, Action
 from app.investigation.workflow import InvestigationWorkflow
 from app.archive.repository import ArchiveRepository
-from app.live.bitcoin import LiveBitcoinFeed, BitcoinFeedResult
+from app.live.bitcoin import LiveBitcoinFeed, BitcoinFeedResult, BitcoinTransactionDetail, InvalidBitcoinTransactionId
 
 
 # Global instances
@@ -219,6 +219,12 @@ class ReviewRequest(BaseModel):
     note: str = Field(min_length=1)
 
 
+class InvestigationProviderStatus(BaseModel):
+    configured_provider: str
+    llm_configured: bool
+    model: str | None = None
+
+
 def get_archive() -> ArchiveRepository:
     archive = ArchiveRepository(settings.ARCHIVE_PATH)
     if not archive.available():
@@ -254,6 +260,18 @@ async def recent_bitcoin_transactions(feed: LiveBitcoinFeed = Depends(get_live_b
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Public Bitcoin source unavailable: %s", exc)
         raise HTTPException(status_code=502, detail="Public Bitcoin feed unavailable")
+
+
+@app.get('/api/v1/live/bitcoin/tx/{txid}', response_model=BitcoinTransactionDetail, tags=['Live public data'])
+async def bitcoin_transaction_detail(txid: str, feed: LiveBitcoinFeed = Depends(get_live_bitcoin_feed)):
+    """Fetch one selected public transaction on demand; no fraud classification."""
+    try:
+        return await feed.detail(txid)
+    except InvalidBitcoinTransactionId:
+        raise HTTPException(status_code=422, detail='Invalid Bitcoin transaction ID')
+    except (httpx.HTTPError, ValidationError, ValueError, KeyError, TypeError) as exc:
+        logger.warning('Public Bitcoin detail unavailable: %s', exc)
+        raise HTTPException(status_code=502, detail='Public Bitcoin transaction detail unavailable')
 
 
 # API Endpoints
@@ -410,6 +428,17 @@ async def start_investigation(transaction_id: str, background_tasks: BackgroundT
     await db.save_case(case.model_dump())
     background_tasks.add_task(_run_investigation, case.case_id, db, cache)
     return case
+
+
+@app.get('/api/v1/investigations/provider-status', response_model=InvestigationProviderStatus,
+         tags=['Investigations'])
+async def investigation_provider_status():
+    """Show local provider configuration without exposing a credential."""
+    return InvestigationProviderStatus(
+        configured_provider=settings.INVESTIGATION_PROVIDER,
+        llm_configured=settings.INVESTIGATION_PROVIDER == 'openai' and bool(settings.OPENAI_API_KEY),
+        model=settings.OPENAI_MODEL if settings.INVESTIGATION_PROVIDER == 'openai' else None,
+    )
 
 
 @app.get("/api/v1/investigations/{case_id}", response_model=Case, tags=["Investigations"])
