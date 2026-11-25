@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field, model_validator
 
 Action = Literal['APPROVE', 'BLOCK', 'REQUEST_VERIFICATION', 'ESCALATE_FOR_REVIEW']
 ReviewReason = Literal['LOW_CONFIDENCE', 'INSUFFICIENT_EVIDENCE', 'RULE_DISAGREEMENT',
-                       'BLOCK_RECOMMENDATION', 'MODEL_FALLBACK']
+                       'BLOCK_RECOMMENDATION', 'MODEL_FALLBACK', 'UNCITED_ANOMALOUS_EVIDENCE']
 
 
 class TriageResult(BaseModel):

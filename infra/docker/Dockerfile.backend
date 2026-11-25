@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq5 curl && 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 COPY backend/app/ ./app/
+COPY backend/alembic.ini ./alembic.ini
+COPY backend/alembic/ ./alembic/
 RUN mkdir -p ./models
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000

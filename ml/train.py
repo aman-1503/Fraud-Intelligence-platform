@@ -15,8 +15,6 @@ from sklearn.metrics import (
 )
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
-import joblib
-import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Tuple, Optional
@@ -249,53 +247,28 @@ class FraudDetectionModel:
         return (proba >= threshold).astype(int)
     
     def save(self, name: str = 'fraud_model') -> str:
-        """Save model and all components."""
+        """Save a hashed booster and JSON scaler. Pickle calibrators are not exported."""
+        from app.ml.artifacts import publish
+
         save_path = self.model_dir / name
-        save_path.mkdir(exist_ok=True)
-        
-        # Save XGBoost model
-        self.model.save_model(save_path / 'xgboost_model.json')
-        
-        # Save calibrator
-        if self.calibrator:
-            joblib.dump(self.calibrator, save_path / 'calibrator.joblib')
-        
-        # Save scaler
-        if self.scaler:
-            joblib.dump(self.scaler, save_path / 'scaler.joblib')
-        
-        # Save metadata
-        with open(save_path / 'metadata.json', 'w') as f:
-            json.dump(self.metadata, f, indent=2)
-        
+        metadata = dict(self.metadata or {})
+        metadata['version'] = name
+        metadata['feature_names'] = list(self.feature_names)
+        publish(save_path, self.model, self.scaler, metadata)
         print(f"\nModel saved to: {save_path}")
         return str(save_path)
     
     def load(self, path: str) -> 'FraudDetectionModel':
-        """Load model from disk."""
-        load_path = Path(path)
-        
-        # Load XGBoost model
-        self.model = xgb.XGBClassifier()
-        self.model.load_model(load_path / 'xgboost_model.json')
-        
-        # Load calibrator
-        calibrator_path = load_path / 'calibrator.joblib'
-        if calibrator_path.exists():
-            self.calibrator = joblib.load(calibrator_path)
-        
-        # Load scaler
-        scaler_path = load_path / 'scaler.joblib'
-        if scaler_path.exists():
-            self.scaler = joblib.load(scaler_path)
-        
-        # Load metadata
-        with open(load_path / 'metadata.json', 'r') as f:
-            self.metadata = json.load(f)
-        
-        self.feature_names = self.metadata.get('feature_names', [])
-        
-        print(f"Model loaded from: {load_path}")
+        """Load a verified artifact. Unsigned joblib files are refused."""
+        from app.ml.artifacts import load_verified
+
+        model, scaler, names, version = load_verified(Path(path), FeatureExtractor().feature_names)
+        self.model = model
+        self.scaler = scaler
+        self.calibrator = None
+        self.feature_names = names
+        self.metadata = {'version': version, 'feature_names': names}
+        print(f"Model loaded from: {path}")
         return self
     
     def cross_validate(
@@ -409,7 +382,8 @@ def create_sample_model():
     # Generate small synthetic dataset
     np.random.seed(42)
     n_samples = 10000
-    n_features = 30
+    feature_names = FeatureExtractor().feature_names
+    n_features = len(feature_names)
     
     X = np.random.randn(n_samples, n_features)
     
@@ -426,23 +400,6 @@ def create_sample_model():
     y = (fraud_score > threshold).astype(int)
     
     print(f"Synthetic dataset: {n_samples} samples, {y.sum()} fraud ({y.mean()*100:.1f}%)")
-    
-    # Create feature names
-    feature_names = [
-        'amount', 'amount_log', 'hour_of_day', 'day_of_week', 
-        'is_weekend', 'is_night', 'is_high_risk_hour',
-        'merchant_risk_score', 'is_high_risk_merchant', 
-        'is_cash_equivalent', 'is_online',
-        'txn_count_1h', 'txn_count_6h', 'txn_count_24h',
-        'amount_sum_1h', 'amount_sum_24h',
-        'unique_merchants_24h', 'unique_countries_24h',
-        'time_since_last_txn_hours', 'velocity_score',
-        'amount_zscore', 'amount_vs_avg_ratio',
-        'is_above_95th_percentile', 'merchant_diversity_score',
-        'spending_velocity_vs_normal',
-        'is_foreign', 'is_high_risk_country', 'country_risk_score',
-        'distance_from_home', 'is_impossible_travel'
-    ]
     
     # Train model
     model = FraudDetectionModel(model_dir='models')

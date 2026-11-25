@@ -22,6 +22,7 @@ services:
       - INVESTIGATION_PROVIDER=${INVESTIGATION_PROVIDER:-deterministic}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4.1-mini}
+      - JWT_SECRET=${JWT_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -163,6 +164,8 @@ services:
       - "8089:8089"
     volumes:
       - ./load-tests:/mnt/locust:ro
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-}
     command: -f /mnt/locust/locustfile.py --host=http://api:8000
     networks:
       - fraud-network

@@ -4,11 +4,14 @@ Logging Configuration
 Structured logging setup for the fraud platform.
 """
 
+import contextvars
 import logging
 import sys
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
+
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
 
 class JSONFormatter(logging.Formatter):
@@ -16,10 +19,11 @@ class JSONFormatter(logging.Formatter):
     
     def format(self, record: logging.LogRecord) -> str:
         log_data: Dict[str, Any] = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
+            "request_id": request_id_var.get(),
         }
         
         # Add extra fields
@@ -53,9 +57,9 @@ class ConsoleFormatter(logging.Formatter):
     
     def format(self, record: logging.LogRecord) -> str:
         color = self.COLORS.get(record.levelname, self.RESET)
-        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
-        message = f"{color}[{timestamp}] {record.levelname:8}{self.RESET} | {record.getMessage()}"
+        message = f"{color}[{timestamp}] {record.levelname:8}{self.RESET} | {request_id_var.get()} | {record.getMessage()}"
         
         if record.exc_info:
             message += f"\n{self.formatException(record.exc_info)}"

@@ -1,337 +1,211 @@
-"""
-Database Module
-===============
-Async PostgreSQL database with connection pooling.
-"""
+"""Postgres access through an asyncpg pool.
 
+Transactions, scores, profiles, and investigation cases all live here.
+There is no in-memory fallback: connect() raises if Postgres is unreachable.
+"""
 import asyncio
-from typing import Optional, Dict, List, Any
-from datetime import datetime
 import json
-import sqlite3
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+import asyncpg
 
 from app.core.config import settings
 from app.core.logging import logger
 
 
+class IdempotencyConflict(Exception):
+    """A transaction_id was reused with a different scoring payload."""
+
+
+def _dsn() -> str:
+    return settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+def _amount(value) -> float:
+    return float(value)
+
+
+def _iso(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
 class Database:
-    """
-    Async PostgreSQL database handler.
-    Uses connection pooling for high throughput.
-    """
-    
     def __init__(self):
-        """Initialize database connection settings."""
-        self.pool = None
-        self._connected = False
-        
-        # In-memory storage for demo (replace with actual DB in production)
-        self._transactions: Dict[str, Dict] = {}
-        self._users: Dict[str, Dict] = {}
-        self._scores: Dict[str, Dict] = {}
-        self._case_db = None
-    
+        self.pool: Optional[asyncpg.Pool] = None
+
     async def connect(self):
-        """Establish database connection pool."""
-        try:
-            # For demo, we use in-memory storage
-            # In production, use asyncpg:
-            # import asyncpg
-            # self.pool = await asyncpg.create_pool(
-            #     settings.DATABASE_URL,
-            #     min_size=5,
-            #     max_size=settings.DATABASE_POOL_SIZE,
-            # )
-            
-            self._connected = True
-            case_path = Path(settings.CASE_DB_PATH)
-            case_path.parent.mkdir(parents=True, exist_ok=True)
-            self._case_db = sqlite3.connect(case_path)
-            self._case_db.execute('CREATE TABLE IF NOT EXISTS investigation_cases (case_id TEXT PRIMARY KEY, transaction_id TEXT UNIQUE NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL)')
-            self._case_db.commit()
-            logger.info("Database connected (in-memory mode)")
-            
-            # Initialize sample data
-            await self._init_sample_data()
-            
-        except Exception as e:
-            logger.error(f"Database connection error: {e}")
-            raise
-    
+        await asyncio.to_thread(_upgrade)
+        self.pool = await asyncpg.create_pool(
+            _dsn(),
+            min_size=1,
+            max_size=settings.DATABASE_POOL_SIZE,
+            command_timeout=10,
+        )
+        async with self.pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        logger.info("Database connected")
+
     async def disconnect(self):
-        """Close database connection pool."""
         if self.pool:
             await self.pool.close()
-        if self._case_db:
-            self._case_db.close()
-            self._case_db = None
-        self._connected = False
+            self.pool = None
         logger.info("Database disconnected")
-    
+
     async def health_check(self) -> bool:
-        """Check database health."""
-        return self._connected
-    
+        if self.pool is None:
+            return False
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval("SELECT 1") == 1
+
     async def get_metrics(self) -> Dict[str, Any]:
-        """Get database metrics."""
-        return {
-            "connected": self._connected,
-            "transactions_count": len(self._transactions),
-            "users_count": len(self._users),
-        }
-    
-    async def _init_sample_data(self):
-        """Initialize sample user data."""
-        sample_users = [
-            {
-                "user_id": "U000001",
-                "home_country": "US",
-                "account_age_days": 365,
-                "avg_txn_amount": 150.0,
-                "std_txn_amount": 75.0,
-                "avg_monthly_txns": 25,
-                "primary_device_id": "device_001",
-                "merchant_diversity": 0.6,
-                "risk_score": 0.15,
-            },
-            {
-                "user_id": "U000002",
-                "home_country": "UK",
-                "account_age_days": 180,
-                "avg_txn_amount": 200.0,
-                "std_txn_amount": 100.0,
-                "avg_monthly_txns": 15,
-                "primary_device_id": "device_002",
-                "merchant_diversity": 0.4,
-                "risk_score": 0.25,
-            },
-            {
-                "user_id": "U000003",
-                "home_country": "US",
-                "account_age_days": 730,
-                "avg_txn_amount": 500.0,
-                "std_txn_amount": 200.0,
-                "avg_monthly_txns": 40,
-                "primary_device_id": "device_003",
-                "merchant_diversity": 0.8,
-                "risk_score": 0.10,
-            },
-        ]
-        
-        for user in sample_users:
-            self._users[user["user_id"]] = user
-    
+        async with self.pool.acquire() as conn:
+            transactions = await conn.fetchval("SELECT COUNT(*) FROM transactions")
+            users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE home_country IS NOT NULL")
+        return {"connected": self.pool is not None, "transactions_count": transactions, "users_count": users}
+
     async def get_user_profile(self, user_id: str) -> Optional[Dict]:
-        """Get user profile by ID."""
-        return self._users.get(user_id)
-    
-    async def update_user_profile(self, user_id: str, profile: Dict):
-        """Update user profile."""
-        if user_id in self._users:
-            self._users[user_id].update(profile)
-        else:
-            self._users[user_id] = profile
-    
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, home_country, account_age_days, avg_txn_amount, std_txn_amount, "
+                "avg_monthly_txns, primary_device_id, merchant_diversity, risk_score "
+                "FROM users WHERE user_id=$1 AND home_country IS NOT NULL",
+                user_id,
+            )
+        if not row:
+            return None
+        profile = dict(row)
+        profile["avg_txn_amount"] = _amount(profile["avg_txn_amount"])
+        profile["std_txn_amount"] = _amount(profile["std_txn_amount"])
+        profile["merchant_diversity"] = _amount(profile["merchant_diversity"] or 0)
+        profile["risk_score"] = _amount(profile["risk_score"] or 0)
+        return profile
+
+    async def ensure_user(self, user_id: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users(user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+                user_id,
+            )
+
     async def get_transaction(self, transaction_id: str) -> Optional[Dict]:
-        """Get transaction by ID."""
-        return self._transactions.get(transaction_id)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT t.payload AS transaction, s.payload AS score "
+                "FROM transactions t LEFT JOIN fraud_scores s USING (transaction_id) "
+                "WHERE t.transaction_id=$1",
+                transaction_id,
+            )
+        if not row:
+            return None
+        transaction = json.loads(row["transaction"])
+        if row["score"]:
+            transaction.update(json.loads(row["score"]))
+        return transaction
 
     async def get_score(self, transaction_id: str) -> Optional[Dict]:
-        return self._scores.get(transaction_id)
+        record = await self.get_score_record(transaction_id)
+        return record["score"] if record else None
+
+    async def get_score_record(self, transaction_id: str) -> Optional[Dict]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT request_hash, payload FROM fraud_scores WHERE transaction_id=$1",
+                transaction_id,
+            )
+        if not row:
+            return None
+        return {"request_hash": row["request_hash"], "score": json.loads(row["payload"])}
+
+    async def get_user_transactions(self, user_id: str, limit: int = 50) -> List[Dict]:
+        limit = max(1, min(int(limit), 100))
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT transaction_id, user_id, amount, merchant_category, country, device_id, timestamp "
+                "FROM transactions WHERE user_id=$1 ORDER BY timestamp DESC LIMIT $2",
+                user_id, limit,
+            )
+        return [
+            {
+                "transaction_id": row["transaction_id"],
+                "user_id": row["user_id"],
+                "amount": _amount(row["amount"]),
+                "merchant_category": row["merchant_category"],
+                "country": row["country"],
+                "device_id": row["device_id"],
+                "timestamp": _iso(row["timestamp"]),
+            }
+            for row in rows
+        ]
+
+    async def log_transaction(self, transaction: Dict, score_result: Dict, request_hash: str = "0" * 64):
+        """Commit the transaction and its score before the caller returns a decision."""
+        transaction_id = transaction["transaction_id"]
+        timestamp = transaction.get("timestamp") or datetime.now(timezone.utc)
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO users(user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+                    transaction["user_id"],
+                )
+                await conn.execute(
+                    "INSERT INTO transactions(transaction_id, user_id, amount, currency, merchant_category, "
+                    "country, device_id, timestamp, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)",
+                    transaction_id, transaction["user_id"], transaction["amount"],
+                    transaction.get("currency") or "USD", transaction["merchant_category"],
+                    transaction.get("country") or "US", transaction.get("device_id"), timestamp,
+                    json.dumps(transaction, default=str),
+                )
+                await conn.execute(
+                    "INSERT INTO fraud_scores(transaction_id, request_hash, fraud_score, risk_level, decision, "
+                    "confidence, model_version, latency_ms, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)",
+                    transaction_id, request_hash, score_result["fraud_score"], score_result["risk_level"],
+                    score_result.get("decision") or "REVIEW", score_result.get("confidence") or 0,
+                    score_result.get("model_version") or "unspecified",
+                    score_result.get("latency_ms") or 0, json.dumps(score_result, default=str),
+                )
 
     async def save_case(self, case: Dict):
-        self._case_db.execute('INSERT INTO investigation_cases(case_id, transaction_id, status, payload) VALUES (?, ?, ?, ?) ON CONFLICT(case_id) DO UPDATE SET status=excluded.status, payload=excluded.payload',
-                              (case['case_id'], case['transaction_id'], case['status'], json.dumps(case, default=str)))
-        self._case_db.commit()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO investigation_cases(case_id, transaction_id, status, payload) "
+                "VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (case_id) DO UPDATE "
+                "SET status=EXCLUDED.status, payload=EXCLUDED.payload",
+                case["case_id"], case["transaction_id"], case["status"], json.dumps(case, default=str),
+            )
 
     async def get_case(self, case_id: str) -> Optional[Dict]:
-        row = self._case_db.execute('SELECT payload FROM investigation_cases WHERE case_id=?', (case_id,)).fetchone()
-        return json.loads(row[0]) if row else None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT payload FROM investigation_cases WHERE case_id=$1", case_id)
+        return json.loads(row["payload"]) if row else None
 
     async def get_case_for_transaction(self, transaction_id: str) -> Optional[Dict]:
-        row = self._case_db.execute('SELECT payload FROM investigation_cases WHERE transaction_id=?', (transaction_id,)).fetchone()
-        return json.loads(row[0]) if row else None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT payload FROM investigation_cases WHERE transaction_id=$1", transaction_id
+            )
+        return json.loads(row["payload"]) if row else None
 
     async def list_review_cases(self) -> List[Dict]:
-        rows = self._case_db.execute("SELECT payload FROM investigation_cases WHERE status='REVIEW_REQUIRED'").fetchall()
-        return [json.loads(row[0]) for row in rows]
-    
-    async def get_user_transactions(
-        self, 
-        user_id: str, 
-        limit: int = 50
-    ) -> List[Dict]:
-        """Get recent transactions for a user."""
-        user_txns = [
-            txn for txn in self._transactions.values()
-            if txn.get('user_id') == user_id
-        ]
-        
-        # Sort by timestamp descending
-        user_txns.sort(
-            key=lambda x: str(x.get('timestamp') or ''),
-            reverse=True
-        )
-        
-        return user_txns[:limit]
-    
-    async def log_transaction(
-        self, 
-        transaction: Dict, 
-        score_result: Dict
-    ):
-        """Log transaction and score to database."""
-        transaction_id = transaction.get('transaction_id')
-        
-        record = {
-            **transaction,
-            'fraud_score': score_result.get('fraud_score'),
-            'risk_level': score_result.get('risk_level'),
-            'decision': score_result.get('decision'),
-            'risk_factors': score_result.get('risk_factors', []),
-            'scored_at': datetime.utcnow().isoformat(),
-        }
-        
-        self._transactions[transaction_id] = record
-        self._scores[transaction_id] = score_result
-    
-    async def get_recent_transactions(
-        self,
-        limit: int = 100,
-        fraud_only: bool = False
-    ) -> List[Dict]:
-        """Get recent transactions across all users."""
-        txns = list(self._transactions.values())
-        
-        if fraud_only:
-            txns = [t for t in txns if t.get('fraud_score', 0) > 0.5]
-        
-        txns.sort(
-            key=lambda x: x.get('scored_at', ''),
-            reverse=True
-        )
-        
-        return txns[:limit]
-    
-    async def get_fraud_statistics(
-        self,
-        hours: int = 24
-    ) -> Dict[str, Any]:
-        """Get fraud statistics for the specified time period."""
-        cutoff = datetime.utcnow().timestamp() - (hours * 3600)
-        
-        recent_txns = [
-            t for t in self._transactions.values()
-            if t.get('scored_at', '') != ''
-        ]
-        
-        total = len(recent_txns)
-        if total == 0:
-            return {
-                "total_transactions": 0,
-                "fraud_count": 0,
-                "fraud_rate": 0,
-                "declined_count": 0,
-                "review_count": 0,
-            }
-        
-        fraud_count = sum(1 for t in recent_txns if t.get('fraud_score', 0) > 0.5)
-        declined = sum(1 for t in recent_txns if t.get('decision') == 'DECLINE')
-        review = sum(1 for t in recent_txns if t.get('decision') == 'REVIEW')
-        
-        return {
-            "total_transactions": total,
-            "fraud_count": fraud_count,
-            "fraud_rate": fraud_count / total if total > 0 else 0,
-            "declined_count": declined,
-            "review_count": review,
-        }
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT payload FROM investigation_cases WHERE status='REVIEW_REQUIRED' ORDER BY case_id"
+            )
+        return [json.loads(row["payload"]) for row in rows]
 
 
-# SQL schema for production PostgreSQL
-SQL_SCHEMA = """
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-    user_id VARCHAR(50) PRIMARY KEY,
-    home_country VARCHAR(3) NOT NULL DEFAULT 'US',
-    account_age_days INTEGER NOT NULL DEFAULT 0,
-    avg_txn_amount DECIMAL(12, 2) NOT NULL DEFAULT 0,
-    std_txn_amount DECIMAL(12, 2) NOT NULL DEFAULT 0,
-    avg_monthly_txns INTEGER NOT NULL DEFAULT 0,
-    primary_device_id VARCHAR(64),
-    merchant_diversity DECIMAL(5, 4) DEFAULT 0.5,
-    risk_score DECIMAL(5, 4) DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+def _upgrade():
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
 
--- Transactions table
-CREATE TABLE IF NOT EXISTS transactions (
-    transaction_id VARCHAR(64) PRIMARY KEY,
-    user_id VARCHAR(50) NOT NULL REFERENCES users(user_id),
-    amount DECIMAL(12, 2) NOT NULL,
-    currency VARCHAR(3) NOT NULL DEFAULT 'USD',
-    merchant_category VARCHAR(50) NOT NULL,
-    merchant_category_code INTEGER,
-    country VARCHAR(3) NOT NULL,
-    is_foreign BOOLEAN DEFAULT FALSE,
-    device_id VARCHAR(64),
-    device_age_days INTEGER,
-    is_new_device BOOLEAN DEFAULT FALSE,
-    ip_address INET,
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    
-    -- Indexes
-    INDEX idx_transactions_user_id (user_id),
-    INDEX idx_transactions_timestamp (timestamp DESC)
-);
-
--- Fraud scores table
-CREATE TABLE IF NOT EXISTS fraud_scores (
-    id SERIAL PRIMARY KEY,
-    transaction_id VARCHAR(64) NOT NULL REFERENCES transactions(transaction_id),
-    fraud_score DECIMAL(5, 4) NOT NULL,
-    risk_level VARCHAR(20) NOT NULL,
-    decision VARCHAR(20) NOT NULL,
-    confidence DECIMAL(5, 4) NOT NULL,
-    risk_factors JSONB DEFAULT '[]',
-    model_version VARCHAR(20) NOT NULL,
-    latency_ms DECIMAL(10, 2) NOT NULL,
-    scored_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    
-    -- Indexes
-    INDEX idx_fraud_scores_transaction_id (transaction_id),
-    INDEX idx_fraud_scores_scored_at (scored_at DESC),
-    INDEX idx_fraud_scores_risk_level (risk_level)
-);
-
--- User transaction history (for velocity features)
-CREATE TABLE IF NOT EXISTS user_transaction_history (
-    id SERIAL PRIMARY KEY,
-    user_id VARCHAR(50) NOT NULL,
-    transaction_id VARCHAR(64) NOT NULL,
-    amount DECIMAL(12, 2) NOT NULL,
-    merchant_category VARCHAR(50) NOT NULL,
-    country VARCHAR(3) NOT NULL,
-    device_id VARCHAR(64),
-    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-    
-    -- Partition by time for efficient querying
-    INDEX idx_user_history_user_timestamp (user_id, timestamp DESC)
-);
-
--- Analytics aggregates
-CREATE TABLE IF NOT EXISTS fraud_analytics_hourly (
-    hour_bucket TIMESTAMP WITH TIME ZONE PRIMARY KEY,
-    total_transactions INTEGER DEFAULT 0,
-    fraud_count INTEGER DEFAULT 0,
-    declined_count INTEGER DEFAULT 0,
-    review_count INTEGER DEFAULT 0,
-    total_amount DECIMAL(15, 2) DEFAULT 0,
-    fraud_amount DECIMAL(15, 2) DEFAULT 0,
-    avg_score DECIMAL(5, 4) DEFAULT 0,
-    avg_latency_ms DECIMAL(10, 2) DEFAULT 0
-);
-"""
+    backend = Path(__file__).resolve().parents[2]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "head")

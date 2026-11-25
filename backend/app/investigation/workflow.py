@@ -38,8 +38,8 @@ class InvestigationWorkflow:
         graph.add_node('evidence_node', self.evidence)
         graph.add_node('investigation_node', self.investigation)
         graph.set_entry_point('triage_node')
-        graph.add_conditional_edges('triage_node', lambda s: 'evidence' if s['triage']['requires_investigation'] else 'investigation',
-                                    {'evidence': 'evidence_node', 'investigation': 'investigation_node'})
+        # Evidence always runs. Skipping it used to let investigation() invent a score item.
+        graph.add_edge('triage_node', 'evidence_node')
         graph.add_edge('evidence_node', 'investigation_node')
         graph.add_edge('investigation_node', END)
         self.graph = graph.compile()
@@ -59,10 +59,9 @@ class InvestigationWorkflow:
         user_id, txn_id = txn['user_id'], txn['transaction_id']
         items = [EvidenceItem(evidence_id=f'score:{txn_id}', kind='score',
                               detail=f"Recorded fraud score {state['score']['fraud_score']:.3f}", transaction_ids=[txn_id])]
-        profile = await self.cache.get_user_profile(user_id) or await self.db.get_user_profile(user_id)
+        profile = await self.db.get_user_profile(user_id)
         history = await self.db.get_user_transactions(user_id, 50)
-        cached_history = await self.cache.get_recent_transactions(user_id) or []
-        by_id = {t['transaction_id']: t for t in history + cached_history if t.get('transaction_id') and t['transaction_id'] != txn_id}
+        by_id = {t['transaction_id']: t for t in history if t.get('transaction_id') and t['transaction_id'] != txn_id}
         history = list(by_id.values())
         if profile:
             avg, std = profile.get('avg_txn_amount'), profile.get('std_txn_amount')
@@ -119,9 +118,9 @@ class InvestigationWorkflow:
 
     async def investigation(self, state: State):
         triage = TriageResult.model_validate(state['triage'])
-        evidence = EvidenceResult.model_validate(state.get('evidence') or {'items': [
-            EvidenceItem(evidence_id=f"score:{state['transaction']['transaction_id']}", kind='score',
-                         detail=f"Recorded fraud score {state['score']['fraud_score']:.3f}").model_dump()]})
+        if not state.get('evidence'):
+            raise ValueError('Evidence was not retrieved')
+        evidence = EvidenceResult.model_validate(state['evidence'])
         fallback = False
         mode = 'deterministic'
         if not triage.requires_investigation:
@@ -144,7 +143,9 @@ class InvestigationWorkflow:
         retrieved = {item.evidence_id for item in evidence.items}
         if not set(result.evidence_ids).issubset(retrieved):
             raise ValueError('Agent cited evidence that was not retrieved')
-        disagreement = (triage.rules_action == 'BLOCK' and result.recommended_action != 'BLOCK') or (triage.rules_action == 'APPROVE' and result.recommended_action != 'APPROVE')
+        anomalous = {item.evidence_id for item in evidence.items if item.anomalous}
+        uncited_anomalous = not anomalous.issubset(set(result.evidence_ids))
+        disagreement = triage.rules_action != result.recommended_action
         review_reasons = []
         if result.confidence < settings.HUMAN_REVIEW_CONFIDENCE_THRESHOLD:
             review_reasons.append('LOW_CONFIDENCE')
@@ -152,6 +153,8 @@ class InvestigationWorkflow:
             review_reasons.append('INSUFFICIENT_EVIDENCE')
         if disagreement:
             review_reasons.append('RULE_DISAGREEMENT')
+        if uncited_anomalous:
+            review_reasons.append('UNCITED_ANOMALOUS_EVIDENCE')
         if result.recommended_action == 'BLOCK':
             review_reasons.append('BLOCK_RECOMMENDATION')
         if fallback:

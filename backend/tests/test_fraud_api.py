@@ -6,7 +6,7 @@ Unit and integration tests for the fraud scoring API.
 
 import pytest
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 
@@ -138,6 +138,21 @@ class TestFeatureExtractor:
         assert features[is_foreign_idx] == 1.0
         assert features[is_high_risk_country_idx] == 1.0
     
+    def test_velocity_accepts_mixed_timezones(self, extractor, sample_user_profile):
+        sample_user_profile['recent_transactions'] = [{
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'amount': 20,
+            'country': 'US',
+            'merchant_category': 'grocery',
+        }]
+        features = extractor.extract({
+            'amount': 40,
+            'merchant_category': 'grocery',
+            'country': 'US',
+            'user_id': 'U000001',
+        }, sample_user_profile)
+        assert features[FeatureExtractor.FEATURE_NAMES.index('txn_count_1h')] >= 1
+
     def test_time_features(self, extractor):
         night_txn = {
             'amount': 100.0,
@@ -163,10 +178,10 @@ class TestFraudScorer:
     """Test fraud scoring engine."""
     
     @pytest.fixture
-    def scorer(self):
-        scorer = FraudScorer()
-        scorer._create_dummy_model()
-        return scorer
+    async def scorer(self):
+        ready = FraudScorer()
+        await ready.initialize()
+        return ready
     
     @pytest.fixture
     def sample_transaction(self):
@@ -273,34 +288,13 @@ class TestAPIEndpoints:
     
     @pytest.fixture
     def client(self):
-        """Create test client."""
         from fastapi.testclient import TestClient
+        from app.core.security import create_access_token
         from app.main import app
-        
-        # Mock dependencies
-        with patch('app.main.fraud_scorer') as mock_scorer:
-            mock_scorer.score = AsyncMock(return_value={
-                'fraud_score': 0.15,
-                'risk_level': 'LOW',
-                'decision': 'APPROVE',
-                'confidence': 0.92,
-                'risk_factors': [],
-            })
-            mock_scorer.model_version = 'v1.0.0'
-            mock_scorer.is_ready = MagicMock(return_value=True)
-            
-            with patch('app.main.database') as mock_db:
-                mock_db.get_user_profile = AsyncMock(return_value=None)
-                mock_db.log_transaction = AsyncMock()
-                mock_db.health_check = AsyncMock(return_value=True)
-                
-                with patch('app.main.redis_cache') as mock_cache:
-                    mock_cache.get_score = AsyncMock(return_value=None)
-                    mock_cache.set_score = AsyncMock()
-                    mock_cache.get_user_profile = AsyncMock(return_value=None)
-                    mock_cache.health_check = AsyncMock(return_value=True)
-                    
-                    yield TestClient(app)
+
+        with TestClient(app) as test_client:
+            test_client.headers["Authorization"] = f"Bearer {create_access_token('tester', 'admin')}"
+            yield test_client
     
     def test_health_endpoint(self, client):
         response = client.get("/health")
@@ -343,10 +337,10 @@ class TestPerformance:
     """Performance and latency tests."""
     
     @pytest.fixture
-    def scorer(self):
-        scorer = FraudScorer()
-        scorer._create_dummy_model()
-        return scorer
+    async def scorer(self):
+        ready = FraudScorer()
+        await ready.initialize()
+        return ready
     
     @pytest.mark.asyncio
     async def test_single_prediction_latency(self, scorer):

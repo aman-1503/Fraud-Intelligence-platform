@@ -22,17 +22,9 @@ data:
   CACHE_TTL_SECONDS: "300"
 
 ---
-# Secret for sensitive data
-apiVersion: v1
-kind: Secret
-metadata:
-  name: fraud-api-secrets
-  namespace: fraud-platform
-type: Opaque
-stringData:
-  DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres-service:5432/fraud_platform"
-  REDIS_URL: "redis://redis-service:6379/0"
-  JWT_SECRET: "your-production-secret-change-this"
+# DATABASE_URL, REDIS_URL, and JWT_SECRET are not stored in this manifest.
+# Create the fraud-api-secrets Secret from the cluster secret manager before applying.
+# The Deployment references that Secret and will not start until it exists.
 
 ---
 # API Deployment

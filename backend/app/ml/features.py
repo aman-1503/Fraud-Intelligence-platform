@@ -8,11 +8,22 @@ Computes velocity, behavioral, geographic, and device features.
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 import hashlib
 from collections import defaultdict
 import json
+
+
+def _as_utc(value):
+    """Compare stored timestamps without mixing naive and aware datetimes."""
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @dataclass
@@ -112,7 +123,7 @@ class FeatureExtractor:
         """Load or update user profile from database."""
         profile = UserProfile(
             user_id=user_id,
-            home_country=profile_data.get('home_country', 'US'),
+            home_country=profile_data.get('home_country') or '',
             account_age_days=profile_data.get('account_age_days', 0),
             avg_txn_amount=profile_data.get('avg_txn_amount', 100.0),
             std_txn_amount=profile_data.get('std_txn_amount', 50.0),
@@ -166,8 +177,11 @@ class FeatureExtractor:
 
         # Geographic features
         country = transaction.get('country', 'US')
-        home_country = user_profile.home_country if user_profile else 'US'
-        features['is_foreign'] = float(transaction.get('is_foreign', country != home_country))
+        home_country = user_profile.home_country if user_profile and user_profile.home_country else ''
+        if transaction.get('is_foreign') is not None and 'is_foreign' in transaction:
+            features['is_foreign'] = float(bool(transaction.get('is_foreign')))
+        else:
+            features['is_foreign'] = float(bool(home_country) and country != home_country)
         features['is_high_risk_country'] = float(country in self.HIGH_RISK_COUNTRIES)
         features['country_risk_score'] = self.COUNTRY_RISK.get(country, 0.3)
         features['distance_from_home'] = self._estimate_distance(home_country, country)
@@ -175,10 +189,12 @@ class FeatureExtractor:
 
         # Device features
         features['is_new_device'] = float(transaction.get('is_new_device', False))
-        features['device_age_days'] = float(transaction.get('device_age_days', 30))
+        # Unknown device age is 0. A default of 30 invented a month of history.
+        device_age = transaction.get('device_age_days', 0)
+        features['device_age_days'] = float(device_age or 0)
         features['device_risk_score'] = self._compute_device_risk(
             transaction.get('is_new_device', False),
-            transaction.get('device_age_days', 30)
+            int(device_age or 0)
         )
         features['devices_used_24h'] = 1.0  # Default, computed with history
 
@@ -219,24 +235,20 @@ class FeatureExtractor:
         if not user_profile or not user_profile.recent_transactions:
             return features
 
-        current_time = transaction.get('timestamp')
-        if isinstance(current_time, str):
-            current_time = datetime.fromisoformat(current_time)
-        elif not isinstance(current_time, datetime):
-            current_time = datetime.now()
+        current_time = _as_utc(transaction.get('timestamp')) or datetime.now(timezone.utc)
 
         merchants_24h = set()
         countries_24h = set()
         last_txn_time = None
 
         for txn in user_profile.recent_transactions:
-            txn_time = txn.get('timestamp')
-            if isinstance(txn_time, str):
-                txn_time = datetime.fromisoformat(txn_time)
-            elif not isinstance(txn_time, datetime):
+            txn_time = _as_utc(txn.get('timestamp'))
+            if txn_time is None:
                 continue
 
             hours_ago = (current_time - txn_time).total_seconds() / 3600
+            if hours_ago < 0:
+                continue
 
             if hours_ago <= 1:
                 features['txn_count_1h'] += 1
@@ -356,18 +368,14 @@ class FeatureExtractor:
             return 0.0
 
         current_country = transaction.get('country', 'US')
-        current_time = transaction.get('timestamp')
-        if isinstance(current_time, str):
-            current_time = datetime.fromisoformat(current_time)
+        current_time = _as_utc(transaction.get('timestamp')) or datetime.now(timezone.utc)
 
         # Check last transaction
         last_txn = user_profile.recent_transactions[-1]
         last_country = last_txn.get('country', 'US')
-        last_time = last_txn.get('timestamp')
-        if isinstance(last_time, str):
-            last_time = datetime.fromisoformat(last_time)
+        last_time = _as_utc(last_txn.get('timestamp'))
 
-        if current_country == last_country:
+        if current_country == last_country or last_time is None:
             return 0.0
 
         hours_diff = (current_time - last_time).total_seconds() / 3600

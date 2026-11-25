@@ -1,22 +1,24 @@
 """
-Load Testing for Fraud Intelligence Platform
-=============================================
-Locust-based load tests to validate 3,000+ RPS throughput.
+Load test for the fraud scoring API.
 
-Run with:
-    locust -f locustfile.py --host=http://localhost:8000
-    
-Or headless:
-    locust -f locustfile.py --host=http://localhost:8000 --headless -u 500 -r 50 -t 60s
+The published throughput is whatever this script measures against a running
+API with Postgres, Redis, and a verified model. Do not treat a target in a
+docstring as a result.
+
+    JWT_SECRET=... locust -f locustfile.py --host=http://localhost:8000 --headless -u 30 -r 10 -t 15s
 """
 
-import random
-import string
-import uuid
-from datetime import datetime
-from locust import HttpUser, task, between, events
+import base64
+import hashlib
+import hmac
 import json
+import os
+import random
 import time
+import uuid
+from datetime import datetime, timezone
+
+from locust import HttpUser, between, events, task
 
 
 # Test data generators
@@ -28,7 +30,24 @@ MERCHANT_CATEGORIES = [
 
 COUNTRIES = ['US', 'UK', 'CA', 'DE', 'FR', 'BR', 'NG', 'RU', 'CN', 'IN']
 
-USER_IDS = [f'U{str(i).zfill(6)}' for i in range(1000)]
+# These ten accounts are inserted by the initial migration.
+USER_IDS = [f"U{i:06d}" for i in range(10)]
+
+
+def _b64(raw: bytes) -> bytes:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+def scorer_token() -> str:
+    secret = os.environ.get("JWT_SECRET", "")
+    header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64(json.dumps(
+        {"sub": "load-test", "role": "scorer", "exp": int(time.time()) + 3600},
+        separators=(",", ":"),
+    ).encode())
+    signing = header + b"." + payload
+    signature = _b64(hmac.new(secret.encode(), signing, hashlib.sha256).digest())
+    return (signing + b"." + signature).decode()
 
 
 def generate_transaction():
@@ -41,7 +60,7 @@ def generate_transaction():
         "merchant_category": random.choice(MERCHANT_CATEGORIES),
         "country": random.choice(COUNTRIES),
         "device_id": f"device_{random.randint(1, 100):03d}",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -50,13 +69,13 @@ def generate_fraud_transaction():
     return {
         "transaction_id": f"TXN-{uuid.uuid4().hex[:12]}",
         "user_id": random.choice(USER_IDS),
-        "amount": round(random.uniform(2000, 10000), 2),  # High amount
+        "amount": round(random.uniform(2000, 5000), 2),  # High amount, still inside the API cap
         "currency": "USD",
         "merchant_category": random.choice(['crypto_exchange', 'money_transfer', 'gambling']),
         "country": random.choice(['NG', 'RU', 'BR']),  # High-risk country
         "device_id": f"new_device_{random.randint(1000, 9999)}",  # New device
         "is_new_device": True,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -66,6 +85,9 @@ class FraudAPIUser(HttpUser):
     """
     
     wait_time = between(0.01, 0.1)  # 10-100ms between requests
+
+    def on_start(self):
+        self.client.headers["Authorization"] = f"Bearer {scorer_token()}"
     
     @task(10)
     def score_normal_transaction(self):
@@ -145,13 +167,13 @@ class FraudAPIUser(HttpUser):
     @task(1)
     def get_user_profile(self):
         """Fetch user profile."""
-        user_id = random.choice(USER_IDS[:10])  # Use first 10 users (seeded in DB)
+        user_id = random.choice(USER_IDS)
         
         with self.client.get(
             f"/api/v1/user/{user_id}/profile",
             catch_response=True
         ) as response:
-            if response.status_code in [200, 404]:  # 404 is OK for non-existent users
+            if response.status_code == 200:
                 response.success()
             else:
                 response.failure(f"Status code: {response.status_code}")
@@ -164,6 +186,9 @@ class HighThroughputUser(HttpUser):
     """
     
     wait_time = between(0, 0.01)  # Near-zero wait
+
+    def on_start(self):
+        self.client.headers["Authorization"] = f"Bearer {scorer_token()}"
     
     @task
     def rapid_score(self):
@@ -217,9 +242,7 @@ def on_test_stop(environment, **kwargs):
 # Performance validation test
 def validate_performance():
     """
-    Validate that the API meets performance requirements:
-    - Sub-150ms P99 latency
-    - 3,000+ RPS throughput
+    Run a short sample and print the measured rate. This does not assert a target.
     """
     import subprocess
     import sys

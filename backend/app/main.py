@@ -1,98 +1,84 @@
 """
 Fraud Intelligence Platform - FastAPI Backend
 ==============================================
-Real-time fraud scoring API with sub-150ms latency.
-Handles 3,000+ RPS with connection pooling and async I/O.
+Real-time fraud scoring API. A scored decision is committed to Postgres
+before the response is returned. Throughput numbers belong in a measured
+benchmark, not in this docstring.
 """
 
-import asyncio
+import math
 import time
-from datetime import datetime
-from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
-import uvicorn
+import asyncpg
 import httpx
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import BaseModel, Field, ValidationError
 
+from app.archive.repository import ArchiveRepository
 from app.core.config import settings
-from app.core.logging import logger, setup_logging
-from app.ml.scorer import FraudScorer
+from app.core.idempotency import request_hash
+from app.core.logging import logger, request_id_var, setup_logging, tx_logger
+from app.core.security import assert_secret_configured, require_roles
 from app.db.database import Database
 from app.db.redis_cache import RedisCache
-from app.investigation.models import Case, InvestigationResult, Action
+from app.investigation.models import Action, Case
 from app.investigation.workflow import InvestigationWorkflow
-from app.archive.repository import ArchiveRepository
-from app.live.bitcoin import LiveBitcoinFeed, BitcoinFeedResult, BitcoinTransactionDetail, InvalidBitcoinTransactionId
+from app.live.bitcoin import BitcoinFeedResult, BitcoinTransactionDetail, InvalidBitcoinTransactionId, LiveBitcoinFeed
+from app.ml.scorer import FraudScorer, ModelNotReady
 
-
-# Global instances
 fraud_scorer: Optional[FraudScorer] = None
 database: Optional[Database] = None
 redis_cache: Optional[RedisCache] = None
 live_bitcoin_feed = LiveBitcoinFeed()
 
+HTTP_REQUESTS = Counter("fraud_http_requests_total", "HTTP requests", ["method", "path", "status"])
+HTTP_LATENCY = Histogram("fraud_http_request_duration_seconds", "HTTP latency", ["method", "path"])
+PREDICTIONS = Counter("fraud_score_predictions_total", "Scored transactions", ["decision"])
+MODEL_READY = Gauge("fraud_model_ready", "1 when a verified model is loaded")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan management."""
     global fraud_scorer, database, redis_cache
-    
-    logger.info("Starting Fraud Intelligence Platform...")
-    
-    # Initialize ML model
-    logger.info("Loading fraud detection model...")
-    fraud_scorer = FraudScorer()
-    await fraud_scorer.initialize()
-    logger.info(f"Model loaded: {fraud_scorer.model_version}")
-    
-    # Initialize database
-    logger.info("Connecting to database...")
+    setup_logging(settings.LOG_LEVEL, settings.LOG_FORMAT)
+    assert_secret_configured()
+    logger.info("Starting Fraud Intelligence Platform")
     database = Database()
     await database.connect()
-    logger.info("Database connected")
-    
-    # Initialize Redis cache
-    logger.info("Connecting to Redis...")
     redis_cache = RedisCache()
     await redis_cache.connect()
-    logger.info("Redis connected")
-    
-    # Warmup model
-    logger.info("Warming up model...")
-    await fraud_scorer.warmup()
-    logger.info("Model warmup complete")
-    
-    logger.info("=" * 50)
-    logger.info("FRAUD INTELLIGENCE PLATFORM READY")
-    logger.info(f"Model version: {fraud_scorer.model_version}")
-    logger.info(f"Target latency: <{settings.TARGET_LATENCY_MS}ms")
-    logger.info("=" * 50)
-    
+    fraud_scorer = FraudScorer()
+    try:
+        await fraud_scorer.initialize()
+    except Exception:
+        logger.exception("Model artifact failed verification")
+        raise
+    if fraud_scorer.is_ready():
+        await fraud_scorer.warmup()
+    MODEL_READY.set(1 if fraud_scorer.is_ready() else 0)
+    logger.info("Model version: %s", fraud_scorer.model_version)
     yield
-    
-    # Cleanup
-    logger.info("Shutting down...")
     if database:
         await database.disconnect()
     if redis_cache:
         await redis_cache.disconnect()
-    logger.info("Shutdown complete")
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Fraud Intelligence Platform",
-    description="Real-time fraud detection API with XGBoost ML pipeline",
+    description="Real-time fraud detection API with an XGBoost scoring pipeline",
     version="1.0.0",
     lifespan=lifespan,
 )
-
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -102,127 +88,376 @@ app.add_middleware(
 )
 
 
-# Request timing middleware
+def _json_safe(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": _json_safe(exc.errors())})
+
+
 @app.middleware("http")
-async def add_timing_header(request: Request, call_next):
-    """Add timing information to response headers."""
-    start_time = time.perf_counter()
-    response = await call_next(request)
-    process_time = (time.perf_counter() - start_time) * 1000
-    response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
+async def observe_request(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    token = request_id_var.set(request_id)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    elapsed = time.perf_counter() - started
+    route = request.scope.get("route")
+    path = route.path if route is not None else "unmatched"
+    HTTP_REQUESTS.labels(request.method, path, str(response.status_code)).inc()
+    HTTP_LATENCY.labels(request.method, path).observe(elapsed)
+    response.headers["X-Process-Time-Ms"] = f"{elapsed * 1000:.2f}"
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
-# Dependency injection
 def get_scorer() -> FraudScorer:
-    """Get fraud scorer instance."""
     if fraud_scorer is None:
         raise HTTPException(status_code=503, detail="Scorer not initialized")
     return fraud_scorer
 
 
 def get_database() -> Database:
-    """Get database instance."""
     if database is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     return database
 
 
 def get_cache() -> RedisCache:
-    """Get Redis cache instance."""
     if redis_cache is None:
         raise HTTPException(status_code=503, detail="Cache not connected")
     return redis_cache
 
 
-# Pydantic models
+def guarded(*roles: str):
+    async def dependency(identity: dict = Depends(require_roles(*roles)), cache: RedisCache = Depends(get_cache)):
+        allowed = await cache.check_rate_limit(
+            identity["sub"], settings.RATE_LIMIT_REQUESTS, settings.RATE_LIMIT_WINDOW_SECONDS
+        )
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        return identity
+
+    return dependency
+
+
 class TransactionRequest(BaseModel):
-    """Incoming transaction for fraud scoring."""
-    transaction_id: str = Field(..., description="Unique transaction identifier")
-    user_id: str = Field(..., description="User/account identifier")
-    amount: float = Field(..., gt=0, description="Transaction amount in USD")
-    currency: str = Field(default="USD", description="Currency code")
-    merchant_category: str = Field(..., description="Merchant category code")
-    country: str = Field(default="US", description="Transaction country")
-    device_id: Optional[str] = Field(None, description="Device fingerprint")
-    timestamp: Optional[datetime] = Field(None, description="Transaction timestamp")
-    
-    # Optional enrichment fields
-    ip_address: Optional[str] = Field(None, description="Client IP address")
-    user_agent: Optional[str] = Field(None, description="Client user agent")
-    session_id: Optional[str] = Field(None, description="Session identifier")
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "transaction_id": "TXN-12345-ABCDE",
-                "user_id": "U000123",
-                "amount": 150.00,
-                "currency": "USD",
-                "merchant_category": "electronics",
-                "country": "US",
-                "device_id": "d8f7e6c5b4a3",
-            }
-        }
+    transaction_id: str = Field(..., min_length=1, max_length=64)
+    user_id: str = Field(..., min_length=1, max_length=50)
+    amount: float = Field(..., gt=0, le=1_000_000, allow_inf_nan=False)
+    currency: str = Field(default="USD", min_length=3, max_length=3)
+    merchant_category: str = Field(..., min_length=1, max_length=50)
+    country: str = Field(default="US", min_length=2, max_length=3)
+    device_id: Optional[str] = Field(None, max_length=64)
+    timestamp: Optional[datetime] = None
+    ip_address: Optional[str] = Field(None, max_length=64)
+    user_agent: Optional[str] = Field(None, max_length=256)
+    session_id: Optional[str] = Field(None, max_length=64)
 
 
 class FraudScore(BaseModel):
-    """Fraud scoring response."""
     transaction_id: str
-    fraud_score: float = Field(..., ge=0, le=1, description="Fraud probability 0-1")
-    risk_level: str = Field(..., description="Risk category: LOW, MEDIUM, HIGH, CRITICAL")
-    decision: str = Field(..., description="Recommended action: APPROVE, REVIEW, DECLINE")
-    confidence: float = Field(..., ge=0, le=1, description="Model confidence")
-    
-    # Timing
-    latency_ms: float = Field(..., description="Processing time in milliseconds")
-    
-    # Risk factors
-    risk_factors: list[str] = Field(default_factory=list, description="Contributing risk factors")
-    
-    # Metadata
-    model_version: str = Field(..., description="Model version used")
-    scored_at: datetime = Field(..., description="Scoring timestamp")
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "transaction_id": "TXN-12345-ABCDE",
-                "fraud_score": 0.15,
-                "risk_level": "LOW",
-                "decision": "APPROVE",
-                "confidence": 0.92,
-                "latency_ms": 45.2,
-                "risk_factors": [],
-                "model_version": "v1.0.0",
-                "scored_at": "2024-01-15T10:30:00Z"
-            }
-        }
+    fraud_score: float = Field(..., ge=0, le=1)
+    risk_level: str
+    decision: str
+    confidence: float = Field(..., ge=0, le=1)
+    latency_ms: float
+    risk_factors: list[str] = Field(default_factory=list)
+    model_version: str
+    scored_at: datetime
 
 
 class BatchRequest(BaseModel):
-    """Batch scoring request."""
     transactions: list[TransactionRequest] = Field(..., max_length=100)
 
 
+class BatchItem(BaseModel):
+    transaction_id: str
+    fraud_score: Optional[float] = None
+    risk_level: Optional[str] = None
+    decision: Optional[str] = None
+    confidence: Optional[float] = None
+    latency_ms: Optional[float] = None
+    risk_factors: list[str] = Field(default_factory=list)
+    model_version: Optional[str] = None
+    scored_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+
 class BatchResponse(BaseModel):
-    """Batch scoring response."""
-    results: list[FraudScore]
+    results: list[BatchItem]
     total_count: int
     avg_latency_ms: float
     total_latency_ms: float
 
 
 class ReviewRequest(BaseModel):
-    reviewer: str = Field(min_length=1)
     final_action: Action
-    note: str = Field(min_length=1)
+    note: str = Field(min_length=1, max_length=2000)
 
 
 class InvestigationProviderStatus(BaseModel):
     configured_provider: str
     llm_configured: bool
     model: str | None = None
+
+
+def _error_code(exc: HTTPException) -> str:
+    if exc.status_code == 409:
+        return "conflict"
+    if exc.status_code == 503:
+        return "unavailable"
+    if exc.status_code == 429:
+        return "rate_limited"
+    return "scoring_failed"
+
+
+async def _score_one(request: TransactionRequest, scorer: FraudScorer, db: Database, cache: RedisCache) -> FraudScore:
+    started = time.perf_counter()
+    payload = request.model_dump()
+    digest = request_hash(payload)
+    try:
+        existing = await db.get_score_record(request.transaction_id)
+        if existing:
+            if existing["request_hash"] != digest:
+                raise HTTPException(status_code=409, detail="Transaction id already scored with a different payload")
+            return FraudScore(**existing["score"])
+        cached = await cache.get_score(request.transaction_id, digest)
+        if cached:
+            return FraudScore(**cached)
+        if not scorer.is_ready():
+            raise HTTPException(status_code=503, detail="Scoring model is not loaded")
+        history = [
+            row for row in await db.get_user_transactions(request.user_id, 100)
+            if row["transaction_id"] != request.transaction_id
+        ]
+        profile = await db.get_user_profile(request.user_id)
+        if profile:
+            await cache.set_user_profile(request.user_id, profile)
+        scoring_profile = None
+        if profile or history:
+            scoring_profile = dict(profile or {})
+            scoring_profile["recent_transactions"] = history
+        await cache.increment_velocity(request.user_id, "1h")
+        score_result = await scorer.score(payload, scoring_profile)
+        latency_ms = (time.perf_counter() - started) * 1000
+        response = FraudScore(
+            transaction_id=request.transaction_id,
+            fraud_score=score_result["fraud_score"],
+            risk_level=score_result["risk_level"],
+            decision=score_result["decision"],
+            confidence=score_result["confidence"],
+            latency_ms=latency_ms,
+            risk_factors=score_result.get("risk_factors", []),
+            model_version=scorer.model_version,
+            scored_at=datetime.now(timezone.utc),
+        )
+        stored = response.model_dump(mode="json")
+        await db.log_transaction(payload, stored, digest)
+        await cache.set_score(request.transaction_id, digest, stored)
+        await cache.add_transaction(request.user_id, {
+            "transaction_id": request.transaction_id,
+            "amount": request.amount,
+            "country": request.country,
+            "device_id": request.device_id,
+            "merchant_category": request.merchant_category,
+            "timestamp": stored["scored_at"],
+        })
+        PREDICTIONS.labels(response.decision).inc()
+        tx_logger.log_score(request.transaction_id, request.user_id, response.fraud_score, response.decision, latency_ms)
+        return response
+    except HTTPException:
+        raise
+    except ModelNotReady:
+        raise HTTPException(status_code=503, detail="Scoring model is not loaded")
+    except asyncpg.UniqueViolationError:
+        existing = await db.get_score_record(request.transaction_id)
+        if existing and existing["request_hash"] == digest:
+            return FraudScore(**existing["score"])
+        raise HTTPException(status_code=409, detail="Transaction id already scored with a different payload")
+    except Exception:
+        logger.exception("Scoring failed")
+        raise HTTPException(status_code=500, detail="Scoring failed")
+
+
+@app.post("/api/v1/score", response_model=FraudScore, tags=["Scoring"])
+async def score_transaction(
+    request: TransactionRequest,
+    identity: dict = Depends(guarded("scorer")),
+    scorer: FraudScorer = Depends(get_scorer),
+    db: Database = Depends(get_database),
+    cache: RedisCache = Depends(get_cache),
+):
+    return await _score_one(request, scorer, db, cache)
+
+
+@app.post("/api/v1/score/batch", response_model=BatchResponse, tags=["Scoring"])
+async def score_batch(
+    request: BatchRequest,
+    identity: dict = Depends(guarded("scorer")),
+    scorer: FraudScorer = Depends(get_scorer),
+    db: Database = Depends(get_database),
+    cache: RedisCache = Depends(get_cache),
+):
+    started = time.perf_counter()
+    results = []
+    latencies = []
+    for txn in request.transactions:
+        try:
+            scored = await _score_one(txn, scorer, db, cache)
+            results.append(BatchItem(**scored.model_dump()))
+            latencies.append(scored.latency_ms)
+        except HTTPException as exc:
+            results.append(BatchItem(transaction_id=txn.transaction_id, error=_error_code(exc)))
+    total_latency = (time.perf_counter() - started) * 1000
+    return BatchResponse(
+        results=results,
+        total_count=len(results),
+        avg_latency_ms=(sum(latencies) / len(latencies)) if latencies else 0,
+        total_latency_ms=total_latency,
+    )
+
+
+@app.get("/api/v1/transaction/{transaction_id}", tags=["Transactions"])
+async def get_transaction(
+    transaction_id: str,
+    identity: dict = Depends(guarded("scorer", "reviewer")),
+    db: Database = Depends(get_database),
+):
+    result = await db.get_transaction(transaction_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return result
+
+
+async def _run_investigation(case_id: str, db: Database, cache: RedisCache, request_id: str):
+    token = request_id_var.set(request_id)
+    try:
+        case = await db.get_case(case_id)
+        transaction = await db.get_transaction(case["transaction_id"])
+        score = await db.get_score(case["transaction_id"])
+        try:
+            state = await InvestigationWorkflow(db, cache).run(transaction, score)
+            case.update(
+                triage=state["triage"], evidence=state["evidence"], result=state["result"],
+                investigation_mode=state["investigation_mode"], provider_fallback=state["provider_fallback"],
+                review_reasons=state["review_reasons"],
+                status="REVIEW_REQUIRED" if state["result"]["requires_human_review"] else "COMPLETE",
+            )
+        except ValueError:
+            logger.exception("Investigation rejected case %s", case_id)
+            case.update(status="FAILED", error="citation_rejected")
+        except Exception:
+            logger.exception("Investigation failed for %s", case_id)
+            case.update(status="FAILED", error="investigation_failed")
+        await db.save_case(case)
+    finally:
+        request_id_var.reset(token)
+
+
+@app.post("/api/v1/investigations/{transaction_id}", response_model=Case, tags=["Investigations"])
+async def start_investigation(
+    transaction_id: str,
+    request: Request,
+    identity: dict = Depends(guarded("reviewer")),
+    db: Database = Depends(get_database),
+    cache: RedisCache = Depends(get_cache),
+):
+    existing = await db.get_case_for_transaction(transaction_id)
+    if existing:
+        return Case.model_validate(existing)
+    transaction, score = await db.get_transaction(transaction_id), await db.get_score(transaction_id)
+    if not transaction or not score:
+        raise HTTPException(status_code=404, detail="Scored transaction not found")
+    case = Case(case_id=str(uuid.uuid4()), transaction_id=transaction_id, status="PENDING")
+    await db.save_case(case.model_dump())
+    # Run before returning so a caller that reads the case cannot observe a missing write.
+    await _run_investigation(case.case_id, db, cache, request.headers.get("x-request-id") or "-")
+    return Case.model_validate(await db.get_case(case.case_id))
+
+
+@app.get("/api/v1/investigations/provider-status", response_model=InvestigationProviderStatus, tags=["Investigations"])
+async def investigation_provider_status():
+    return InvestigationProviderStatus(
+        configured_provider=settings.INVESTIGATION_PROVIDER,
+        llm_configured=settings.INVESTIGATION_PROVIDER == "openai" and bool(settings.OPENAI_API_KEY),
+        model=settings.OPENAI_MODEL if settings.INVESTIGATION_PROVIDER == "openai" else None,
+    )
+
+
+@app.get("/api/v1/investigations/{case_id}", response_model=Case, tags=["Investigations"])
+async def get_investigation(
+    case_id: str,
+    identity: dict = Depends(guarded("reviewer")),
+    db: Database = Depends(get_database),
+):
+    case = await db.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    return Case.model_validate(case)
+
+
+@app.get("/api/v1/review/cases", response_model=list[Case], tags=["Review"])
+async def list_review_cases(
+    identity: dict = Depends(guarded("reviewer")),
+    db: Database = Depends(get_database),
+):
+    return [Case.model_validate(case) for case in await db.list_review_cases()]
+
+
+@app.post("/api/v1/review/cases/{case_id}", response_model=Case, tags=["Review"])
+async def review_case(
+    case_id: str,
+    review: ReviewRequest,
+    identity: dict = Depends(guarded("reviewer")),
+    db: Database = Depends(get_database),
+):
+    case = await db.get_case(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    if case["status"] != "REVIEW_REQUIRED":
+        raise HTTPException(status_code=409, detail="Case does not require review")
+    case.update(status="REVIEWED", final_action=review.final_action, reviewer=identity["sub"], review_note=review.note)
+    await db.save_case(case)
+    return Case.model_validate(case)
+
+
+@app.get("/api/v1/user/{user_id}/profile", tags=["Users"])
+async def get_user_profile(
+    user_id: str,
+    identity: dict = Depends(guarded("scorer", "reviewer")),
+    db: Database = Depends(get_database),
+    cache: RedisCache = Depends(get_cache),
+):
+    profile = await cache.get_user_profile(user_id)
+    if profile:
+        return profile
+    profile = await db.get_user_profile(user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+    await cache.set_user_profile(user_id, profile)
+    return profile
+
+
+@app.get("/api/v1/user/{user_id}/transactions", tags=["Users"])
+async def get_user_transactions(
+    user_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    identity: dict = Depends(guarded("scorer", "reviewer")),
+    db: Database = Depends(get_database),
+):
+    return await db.get_user_transactions(user_id, limit)
 
 
 def get_archive() -> ArchiveRepository:
@@ -234,14 +469,12 @@ def get_archive() -> ArchiveRepository:
 
 @app.get("/api/v1/archive/metadata", tags=["Real-world archive"])
 async def archive_metadata(archive: ArchiveRepository = Depends(get_archive)):
-    """Measured holdout metrics and source provenance; historical data, not a live feed."""
     return archive.metadata()
 
 
 @app.get("/api/v1/archive/rows", tags=["Real-world archive"])
 async def archive_rows(after: int = -1, limit: int = 20, known_fraud_only: bool = False,
                        archive: ArchiveRepository = Depends(get_archive)):
-    """Replay held-out rows in their original time order without invented enrichment."""
     try:
         return archive.rows(after, limit, known_fraud_only)
     except ValueError as exc:
@@ -254,7 +487,6 @@ def get_live_bitcoin_feed() -> LiveBitcoinFeed:
 
 @app.get("/api/v1/live/bitcoin/recent", response_model=BitcoinFeedResult, tags=["Live public data"])
 async def recent_bitcoin_transactions(feed: LiveBitcoinFeed = Depends(get_live_bitcoin_feed)):
-    """Live unconfirmed Bitcoin activity; these transactions are not fraud-labeled."""
     try:
         return await feed.recent()
     except (httpx.HTTPError, ValueError) as exc:
@@ -262,248 +494,20 @@ async def recent_bitcoin_transactions(feed: LiveBitcoinFeed = Depends(get_live_b
         raise HTTPException(status_code=502, detail="Public Bitcoin feed unavailable")
 
 
-@app.get('/api/v1/live/bitcoin/tx/{txid}', response_model=BitcoinTransactionDetail, tags=['Live public data'])
+@app.get("/api/v1/live/bitcoin/tx/{txid}", response_model=BitcoinTransactionDetail, tags=["Live public data"])
 async def bitcoin_transaction_detail(txid: str, feed: LiveBitcoinFeed = Depends(get_live_bitcoin_feed)):
-    """Fetch one selected public transaction on demand; no fraud classification."""
     try:
         return await feed.detail(txid)
     except InvalidBitcoinTransactionId:
-        raise HTTPException(status_code=422, detail='Invalid Bitcoin transaction ID')
+        raise HTTPException(status_code=422, detail="Invalid Bitcoin transaction ID")
     except (httpx.HTTPError, ValidationError, ValueError, KeyError, TypeError) as exc:
-        logger.warning('Public Bitcoin detail unavailable: %s', exc)
-        raise HTTPException(status_code=502, detail='Public Bitcoin transaction detail unavailable')
+        logger.warning("Public Bitcoin detail unavailable: %s", exc)
+        raise HTTPException(status_code=502, detail="Public Bitcoin transaction detail unavailable")
 
 
-# API Endpoints
-@app.post("/api/v1/score", response_model=FraudScore, tags=["Scoring"])
-async def score_transaction(
-    request: TransactionRequest,
-    background_tasks: BackgroundTasks,
-    scorer: FraudScorer = Depends(get_scorer),
-    db: Database = Depends(get_database),
-    cache: RedisCache = Depends(get_cache),
-):
-    """
-    Score a single transaction for fraud risk.
-    
-    Returns fraud probability, risk level, and recommended decision.
-    Target latency: <150ms P99
-    """
-    start_time = time.perf_counter()
-    
-    try:
-        # Check cache first
-        cached_score = await cache.get_score(request.transaction_id)
-        if cached_score:
-            cached_score['latency_ms'] = (time.perf_counter() - start_time) * 1000
-            return FraudScore(**cached_score)
-        
-        # Get user profile from cache/db
-        user_profile = await cache.get_user_profile(request.user_id)
-        if not user_profile:
-            user_profile = await db.get_user_profile(request.user_id)
-            if user_profile:
-                await cache.set_user_profile(request.user_id, user_profile)
-        
-        # Score transaction
-        score_result = await scorer.score(request.model_dump(), user_profile)
-        
-        # Calculate latency
-        latency_ms = (time.perf_counter() - start_time) * 1000
-        
-        # Build response
-        response = FraudScore(
-            transaction_id=request.transaction_id,
-            fraud_score=score_result['fraud_score'],
-            risk_level=score_result['risk_level'],
-            decision=score_result['decision'],
-            confidence=score_result['confidence'],
-            latency_ms=latency_ms,
-            risk_factors=score_result.get('risk_factors', []),
-            model_version=scorer.model_version,
-            scored_at=datetime.utcnow(),
-        )
-        
-        # Cache result
-        await cache.set_score(request.transaction_id, response.model_dump())
-        
-        # Log to database (async, non-blocking)
-        background_tasks.add_task(
-            db.log_transaction,
-            request.model_dump(),
-            response.model_dump()
-        )
-        
-        return response
-        
-    except Exception as e:
-        logger.error(f"Scoring error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/v1/score/batch", response_model=BatchResponse, tags=["Scoring"])
-async def score_batch(
-    request: BatchRequest,
-    background_tasks: BackgroundTasks,
-    scorer: FraudScorer = Depends(get_scorer),
-    db: Database = Depends(get_database),
-    cache: RedisCache = Depends(get_cache),
-):
-    """
-    Score multiple transactions in batch.
-    
-    Maximum 100 transactions per batch.
-    """
-    start_time = time.perf_counter()
-    results = []
-    
-    for txn in request.transactions:
-        try:
-            score = await score_transaction(txn, background_tasks, scorer, db, cache)
-            results.append(score)
-        except Exception as e:
-            logger.error(f"Batch scoring error for {txn.transaction_id}: {e}")
-            results.append(FraudScore(
-                transaction_id=txn.transaction_id,
-                fraud_score=0.5,
-                risk_level="UNKNOWN",
-                decision="REVIEW",
-                confidence=0.0,
-                latency_ms=0,
-                risk_factors=["SCORING_ERROR"],
-                model_version=scorer.model_version,
-                scored_at=datetime.utcnow(),
-            ))
-    
-    total_latency = (time.perf_counter() - start_time) * 1000
-    avg_latency = total_latency / len(results) if results else 0
-    
-    return BatchResponse(
-        results=results,
-        total_count=len(results),
-        avg_latency_ms=avg_latency,
-        total_latency_ms=total_latency,
-    )
-
-
-@app.get("/api/v1/transaction/{transaction_id}", tags=["Transactions"])
-async def get_transaction(
-    transaction_id: str,
-    db: Database = Depends(get_database),
-):
-    """Get transaction details and score history."""
-    result = await db.get_transaction(transaction_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-    return result
-
-
-async def _run_investigation(case_id: str, db: Database, cache: RedisCache):
-    case = await db.get_case(case_id)
-    transaction = await db.get_transaction(case['transaction_id'])
-    score = await db.get_score(case['transaction_id'])
-    try:
-        state = await InvestigationWorkflow(db, cache).run(transaction, score)
-        case.update(triage=state['triage'], evidence=state['evidence'], result=state['result'],
-                    investigation_mode=state['investigation_mode'], provider_fallback=state['provider_fallback'],
-                    review_reasons=state['review_reasons'],
-                    status='REVIEW_REQUIRED' if state['result']['requires_human_review'] else 'COMPLETE')
-    except Exception as exc:
-        logger.exception("Investigation failed for %s", case_id)
-        case.update(status='FAILED', error=str(exc))
-    await db.save_case(case)
-
-
-@app.post("/api/v1/investigations/{transaction_id}", response_model=Case, tags=["Investigations"])
-async def start_investigation(transaction_id: str, background_tasks: BackgroundTasks,
-                              db: Database = Depends(get_database), cache: RedisCache = Depends(get_cache)):
-    """Start an investigation for an already scored transaction; scoring stays independent."""
-    existing = await db.get_case_for_transaction(transaction_id)
-    if existing:
-        return Case.model_validate(existing)
-    transaction, score = await db.get_transaction(transaction_id), await db.get_score(transaction_id)
-    if not transaction or not score:
-        raise HTTPException(status_code=404, detail="Scored transaction not found")
-    case = Case(case_id=str(uuid.uuid4()), transaction_id=transaction_id, status='PENDING')
-    await db.save_case(case.model_dump())
-    background_tasks.add_task(_run_investigation, case.case_id, db, cache)
-    return case
-
-
-@app.get('/api/v1/investigations/provider-status', response_model=InvestigationProviderStatus,
-         tags=['Investigations'])
-async def investigation_provider_status():
-    """Show local provider configuration without exposing a credential."""
-    return InvestigationProviderStatus(
-        configured_provider=settings.INVESTIGATION_PROVIDER,
-        llm_configured=settings.INVESTIGATION_PROVIDER == 'openai' and bool(settings.OPENAI_API_KEY),
-        model=settings.OPENAI_MODEL if settings.INVESTIGATION_PROVIDER == 'openai' else None,
-    )
-
-
-@app.get("/api/v1/investigations/{case_id}", response_model=Case, tags=["Investigations"])
-async def get_investigation(case_id: str, db: Database = Depends(get_database)):
-    case = await db.get_case(case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
-    return Case.model_validate(case)
-
-
-@app.get("/api/v1/review/cases", response_model=list[Case], tags=["Review"])
-async def list_review_cases(db: Database = Depends(get_database)):
-    return [Case.model_validate(case) for case in await db.list_review_cases()]
-
-
-@app.post("/api/v1/review/cases/{case_id}", response_model=Case, tags=["Review"])
-async def review_case(case_id: str, review: ReviewRequest, db: Database = Depends(get_database)):
-    case = await db.get_case(case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
-    if case['status'] != 'REVIEW_REQUIRED':
-        raise HTTPException(status_code=409, detail="Case does not require review")
-    case.update(status='REVIEWED', final_action=review.final_action, reviewer=review.reviewer,
-                review_note=review.note)
-    await db.save_case(case)
-    return Case.model_validate(case)
-
-
-@app.get("/api/v1/user/{user_id}/profile", tags=["Users"])
-async def get_user_profile(
-    user_id: str,
-    db: Database = Depends(get_database),
-    cache: RedisCache = Depends(get_cache),
-):
-    """Get user profile and risk summary."""
-    # Try cache first
-    profile = await cache.get_user_profile(user_id)
-    if profile:
-        return profile
-    
-    # Get from database
-    profile = await db.get_user_profile(user_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Cache for next time
-    await cache.set_user_profile(user_id, profile)
-    return profile
-
-
-@app.get("/api/v1/user/{user_id}/transactions", tags=["Users"])
-async def get_user_transactions(
-    user_id: str,
-    limit: int = 50,
-    db: Database = Depends(get_database),
-):
-    """Get recent transactions for a user."""
-    return await db.get_user_transactions(user_id, limit)
-
-
-# Health check endpoints
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Basic health check."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/health/ready", tags=["Health"])
@@ -512,62 +516,33 @@ async def readiness_check(
     db: Database = Depends(get_database),
     cache: RedisCache = Depends(get_cache),
 ):
-    """Readiness check - verifies all components are ready."""
+    async def probe(awaitable):
+        try:
+            return bool(await awaitable)
+        except Exception:
+            return False
+
     checks = {
         "model": scorer.is_ready(),
-        "database": await db.health_check(),
-        "cache": await cache.health_check(),
+        "database": await probe(db.health_check()),
+        "cache": await probe(cache.health_check()),
     }
-    
-    all_ready = all(checks.values())
-    status = "ready" if all_ready else "not_ready"
-    
-    return {
-        "status": status,
-        "checks": checks,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+    MODEL_READY.set(1 if checks["model"] else 0)
+    body = {"status": "ready" if all(checks.values()) else "not_ready", "checks": checks,
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+    return JSONResponse(status_code=200 if all(checks.values()) else 503, content=body)
 
 
 @app.get("/health/live", tags=["Health"])
 async def liveness_check():
-    """Liveness check - verifies the service is running."""
-    return {"status": "alive", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "alive", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/metrics", tags=["Monitoring"])
-async def get_metrics(
-    scorer: FraudScorer = Depends(get_scorer),
-    db: Database = Depends(get_database),
-    cache: RedisCache = Depends(get_cache),
-):
-    """Get platform metrics for monitoring."""
-    return {
-        "model": {
-            "version": scorer.model_version,
-            "predictions_total": scorer.metrics.get('predictions_total', 0),
-            "avg_latency_ms": scorer.metrics.get('avg_latency_ms', 0),
-        },
-        "database": await db.get_metrics(),
-        "cache": await cache.get_metrics(),
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-
-# Include routers
-# app.include_router(health.router, prefix="/health", tags=["Health"])
-# app.include_router(transactions.router, prefix="/api/v1/transactions", tags=["Transactions"])
-# app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":
     setup_logging()
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        workers=4,
-        loop="uvloop",
-        http="httptools",
-        log_level="info",
-    )
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, loop="uvloop", http="httptools", log_level="info")

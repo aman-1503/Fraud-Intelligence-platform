@@ -199,32 +199,32 @@ async def test_openai_unavailable_uses_deterministic_fallback(stores):
     assert state['result']['requires_human_review'] is True
 
 
-def test_human_override_and_saved_status(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, 'CASE_DB_PATH', str(tmp_path / 'cases.sqlite3'))
+def test_human_override_and_saved_status():
+    from app.core.security import create_access_token
+    headers = {"Authorization": f"Bearer {create_access_token('test-reviewer', 'admin')}"}
     with TestClient(app) as client:
         txn = transaction('API-CASE-1')
         txn['timestamp'] = txn['timestamp'].isoformat()
-        scored = client.post('/api/v1/score', json=txn)
+        scored = client.post('/api/v1/score', json=txn, headers=headers)
         assert scored.status_code == 200, scored.text
-        started = client.post('/api/v1/investigations/API-CASE-1')
+        started = client.post('/api/v1/investigations/API-CASE-1', headers=headers)
         assert started.status_code == 200, started.text
         case_id = started.json()['case_id']
-        case = client.get(f'/api/v1/investigations/{case_id}').json()
+        case = client.get(f'/api/v1/investigations/{case_id}', headers=headers).json()
         assert case['status'] == 'REVIEW_REQUIRED', case
         assert case['result']['evidence_ids']
         assert case['review_reasons']
-        listed = client.get('/api/v1/review/cases').json()
+        listed = client.get('/api/v1/review/cases', headers=headers).json()
         assert any(item['case_id'] == case_id for item in listed)
         reviewed = client.post(f'/api/v1/review/cases/{case_id}', json={
-            'reviewer': 'test-reviewer', 'final_action': 'REQUEST_VERIFICATION',
-            'note': 'Customer verification required before blocking'})
+            'final_action': 'REQUEST_VERIFICATION',
+            'note': 'Customer verification required before blocking'}, headers=headers)
         assert reviewed.status_code == 200, reviewed.text
-        saved = client.get(f'/api/v1/investigations/{case_id}').json()
+        saved = client.get(f'/api/v1/investigations/{case_id}', headers=headers).json()
         assert saved['status'] == 'REVIEWED'
         assert saved['final_action'] == 'REQUEST_VERIFICATION'
         assert saved['reviewer'] == 'test-reviewer'
 
-    # Re-open the file through a new adapter to verify durable review state.
     import asyncio
     async def reopened():
         db = Database()
@@ -246,19 +246,68 @@ def test_provider_status_does_not_expose_credential(monkeypatch):
     assert 'test-secret-value' not in response.text
 
 
+class CitingOneItem:
+    async def recommend(self, transaction, score, triage, evidence):
+        return {'recommended_action': 'APPROVE', 'confidence': 0.91,
+                'risk_summary': 'Only the score was cited.',
+                'evidence_ids': [evidence.items[0].evidence_id], 'requires_human_review': False}
+
+
+@pytest.mark.asyncio
+async def test_uncited_anomalous_evidence_forces_human_review(stores):
+    db, cache = stores
+    state = await InvestigationWorkflow(db, cache, CitingOneItem()).run(transaction(), score(0.9, 'CRITICAL'))
+    anomalous = [item['evidence_id'] for item in state['evidence']['items'] if item['anomalous']]
+    assert len(anomalous) >= 3
+    assert state['result']['evidence_ids'] == ['score:T-1']
+    assert state['result']['requires_human_review'] is True
+    assert 'UNCITED_ANOMALOUS_EVIDENCE' in state['review_reasons']
+
+
+class ApproveEverything:
+    async def recommend(self, transaction, score, triage, evidence):
+        return {'recommended_action': 'APPROVE', 'confidence': 0.91,
+                'risk_summary': 'Approve despite the rules action.',
+                'evidence_ids': [item.evidence_id for item in evidence.items],
+                'requires_human_review': False}
+
+
+@pytest.mark.asyncio
+async def test_escalate_then_approve_is_disagreement(stores):
+    db, cache = stores
+    state = await InvestigationWorkflow(db, cache, ApproveEverything()).run(transaction(), score(0.7, 'HIGH'))
+    assert state['triage']['rules_action'] == 'ESCALATE_FOR_REVIEW'
+    assert state['result']['recommended_action'] == 'APPROVE'
+    assert 'RULE_DISAGREEMENT' in state['review_reasons']
+    assert state['result']['requires_human_review'] is True
+
+
+@pytest.mark.asyncio
+async def test_investigation_does_not_invent_evidence(stores):
+    db, cache = stores
+    workflow = InvestigationWorkflow(db, cache, UnavailableProvider())
+    with pytest.raises(ValueError, match='Evidence was not retrieved'):
+        await workflow.investigation({
+            'transaction': transaction(),
+            'score': score(),
+            'triage': {'requires_investigation': True, 'rules_action': 'ESCALATE_FOR_REVIEW', 'reason': 'test'},
+        })
+
+
 @pytest.mark.asyncio
 async def test_exported_xgboost_artifact_used_for_immediate_score(tmp_path, monkeypatch):
-    names = FeatureExtractor.FEATURE_NAMES[:30]
+    from app.ml.artifacts import publish
+    names = FeatureExtractor().feature_names
     rng = np.random.default_rng(7)
     X = rng.normal(size=(24, len(names)))
     y = np.array([0, 1] * 12)
     model = xgb.XGBClassifier(n_estimators=2, max_depth=2, n_jobs=1)
     model.fit(X, y)
-    model.save_model(tmp_path / 'xgboost_model.json')
-    (tmp_path / 'metadata.json').write_text(json.dumps({'feature_names': names, 'version': 'test-artifact'}))
+    publish(tmp_path, model, None, {'feature_names': names, 'version': 'test-artifact'})
     monkeypatch.setenv('MODEL_PATH', str(tmp_path))
     scorer = await FraudScorer().initialize()
     result = await scorer.score(transaction())
     assert scorer.model is not None
     assert scorer.model_version == 'test-artifact'
     assert 0 <= result['fraud_score'] <= 1
+    assert result['confidence'] == pytest.approx(max(result['fraud_score'], 1 - result['fraud_score']))
