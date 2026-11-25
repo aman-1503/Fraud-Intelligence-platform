@@ -61,29 +61,31 @@ curl -L --fail https://www.openml.org/data/v1/download/1673544/creditcard.arff -
 cd ml && python train_real.py && cd ..
 ```
 
-Then run `cd frontend && npm ci && npm run dev` in a second terminal. API docs are at `http://localhost:8000/docs`; the three tabs are at `http://localhost:3000`. The live REST endpoint is `GET /api/v1/live/bitcoin/recent`; archive endpoints are `GET /api/v1/archive/metadata` and `GET /api/v1/archive/rows?after=-1&limit=20`. For the original transaction-scoring API, an optional synthetic sample artifact can be produced with `cd ml && python train.py --sample`; set `MODEL_PATH` to that output. Without an artifact, `/score` reports `rules-only` and uses deterministic rules. The archive's XGBoost model is separate because its anonymized columns do not match the `/score` transaction schema.
+Then run `cd frontend && npm ci && npm run dev` in a second terminal. API docs are at `http://localhost:8000/docs`; the three tabs are at `http://localhost:3000`. The live REST endpoint is `GET /api/v1/live/bitcoin/recent`; archive endpoints are `GET /api/v1/archive/metadata` and `GET /api/v1/archive/rows?after=-1&limit=20`. Scoring, case reads, and reviews require `Authorization: Bearer <jwt>`. Mint a token whose `role` is `scorer`, `reviewer`, or `admin` (the UI uses `admin`) with the same `JWT_SECRET` the API process loaded, and pass it to Vite as `VITE_API_TOKEN`. The API refuses to start when `JWT_SECRET` is empty or still a placeholder.
 
-To use a real model for flagged investigations, set `INVESTIGATION_PROVIDER=openai`, `OPENAI_API_KEY` to your own API key, and optionally `OPENAI_MODEL` (default `gpt-4.1-mini`) before starting the API. For Docker, put these in an ignored root `.env` or export them before `docker compose up`. [Responses API structured-output documentation](https://platform.openai.com/docs/api-reference/responses/create). Without a key the workflow still runs locally in deterministic mode; an explicit `openai` mode with an unavailable key records fallback. Do not send real cardholder data until the integration has privacy and access controls.
+`/score` returns 503 until `MODEL_PATH` contains a verified artifact (`xgboost_model.json`, `metadata.json` with a sha256 and the training feature order, optional `scaler.json`). `cd ml && python train.py --sample` writes that contract. A booster whose feature order does not match the extractor is refused. The archive's XGBoost model is separate because its anonymized columns do not match the `/score` transaction schema.
+
+To use a real model for flagged investigations, set `INVESTIGATION_PROVIDER=openai`, `OPENAI_API_KEY` to your own API key, and optionally `OPENAI_MODEL` (default `gpt-4.1-mini`) before starting the API. For Docker, put these in an ignored root `.env` or export them before `docker compose up`. [Responses API structured-output documentation](https://platform.openai.com/docs/api-reference/responses/create). Without a key the workflow still runs locally in deterministic mode; an explicit `openai` mode with an unavailable key records fallback. The OpenAI call keeps a 20 second timeout, retries 429 and 5xx a fixed number of times, and opens a circuit breaker after repeated transport failures. A citation-validation failure is not retried. This path is still untested against a live key in CI. `OPENAI_LIVE=1` with a real `OPENAI_API_KEY` enables `test_live_openai_investigation`. Do not send real cardholder data until the integration has privacy and access controls.
 
 The archive table fetches 20 rows per page from 42,722 held-out rows. Use **Load next 20**, **Play replay**, or **Show known fraud only**; the table keeps the latest 100 displayed to stay responsive.
 
-Docker Compose defines API, PostgreSQL, Redis, frontend, Prometheus, and Grafana services: after `train_real.py`, run `docker compose up --build -d`. Compose mounts the archive artifact read-only and a named volume for the SQLite case file. The current `Database` and `RedisCache` Python adapters still use in-memory dictionaries for transactions, profiles, and cache entries.
+Docker Compose defines API, PostgreSQL, Redis, frontend, Prometheus, and Grafana services: after `train_real.py`, export `JWT_SECRET` and run `docker compose up --build -d`. Compose mounts the archive artifact read-only. Transactions, scores, profiles, and investigation cases are stored in Postgres. Redis holds score cache entries, velocity counters, and rate-limit counts. `DATABASE_URL` and `REDIS_URL` are required at startup; there is no in-memory fallback. Alembic applies `backend/alembic/versions/001_initial.sql` on connect. The same SQL is mounted for a fresh Postgres volume.
 
 ## Example
 
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/score \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"transaction_id":"TXN-1","user_id":"U000001","amount":5000,"merchant_category":"crypto_exchange","country":"NG","device_id":"new-device"}'
-curl -s -X POST http://localhost:8000/api/v1/investigations/TXN-1
-curl -s http://localhost:8000/api/v1/investigations/<case_id>
-curl -s http://localhost:8000/api/v1/review/cases
+curl -s -X POST http://localhost:8000/api/v1/investigations/TXN-1 -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:8000/api/v1/investigations/<case_id> -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:8000/api/v1/review/cases -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://localhost:8000/api/v1/review/cases/<case_id> \
-  -H 'Content-Type: application/json' \
-  -d '{"reviewer":"analyst-1","final_action":"REQUEST_VERIFICATION","note":"Verify customer identity"}'
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"final_action":"REQUEST_VERIFICATION","note":"Verify customer identity"}'
 ```
 
-The start endpoint returns `PENDING`; retrieve the case by its returned `case_id`. A result has this shape (values depend on the stored transaction and evidence):
+The investigation is finished before that response returns, so the case is not left `PENDING` while a later read races the write. The reviewer stored on a review is the token subject. A second body for the same `transaction_id` with different scoring fields returns 409. A result has this shape (values depend on the stored transaction and evidence):
 
 ```json
 {
@@ -110,4 +112,15 @@ The suite covers scorer/API behavior, graph triage, evidence gaps and missing ti
 
 ## Current limits
 
-This is a local MVP, not a deployed decisioning system. The live Bitcoin feed can fail or be rate-limited by its public upstream and has no confirmed fraud outcomes. The ULB archive has real labels but only `Time`, `Amount`, and anonymized `V1–V28`; it provides no stable customer, device, merchant, or country evidence. Neither source can serve as a live pre-payment **card** fraud feed or run the existing evidence investigation for its missing fields. Transactions and user profiles in the original API remain process-local; only case/review records are saved to SQLite. There is no authenticated reviewer role, payment-company integration, email alert, or live OpenAI call verified without a credential. PostgreSQL and Redis containers exist in the Docker stack but the Python adapters do not yet connect to them. Benchmark model scores are not calibrated probabilities; use a real payment source and domain-specific validation before making real decisions.
+This is a local MVP, not a deployed decisioning system. The live Bitcoin feed can fail or be rate-limited by its public upstream and has no confirmed fraud outcomes. The ULB archive has real labels but only `Time`, `Amount`, and anonymized `V1–V28`; it provides no stable customer, device, merchant, or country evidence. Neither source can serve as a live pre-payment **card** fraud feed or run the existing evidence investigation for its missing fields. Scoring, investigation, and review require a JWT. Kubernetes expects `DATABASE_URL`, `REDIS_URL`, and `JWT_SECRET` from a Secret created outside this repo. There is no payment-company integration, email alert, or live OpenAI call verified without a credential.
+
+Velocity, impossible-travel, and device-age features are computed from transactions already committed for that user. A first transaction for an account has no history, so those features stay at their empty defaults until a later request. Confidence on a loaded model is `max(p, 1-p)` from `predict_proba`. It is not a calibrated probability. Use a real payment source and domain-specific validation before making real decisions.
+
+Measured on 25 Nov 2026, about 4:33 PM America/New_York, on this 4 vCPU / 15 GiB Linux VM, two uvicorn workers, local Postgres 16, local Redis, and the demo velocity artifact:
+
+```bash
+JWT_SECRET=... RATE_LIMIT_REQUESTS=1000000 MODEL_PATH=/tmp/fraud-test-model \
+  locust -f load-tests/locustfile.py --headless -u 30 -r 10 -t 15s --host http://127.0.0.1:8000
+```
+
+Locust reported 134.4 requests/sec overall and 125.3 requests/sec on `POST /api/v1/score` (1,863 score requests). Median score latency was 150 ms, p95 290 ms, p99 370 ms. 14.22% of score samples were marked failed by the script in that run because it then treated latency over 150 ms as a failure; the API responses were HTTP 200. The script no longer does that. A 200 with a fraud score is a success, and latency stays in the percentile summary. That sample is the measured number. It is not a 3,000 RPS claim. `.github/workflows/load-test.yml` repeats a shorter sample and is allowed to fail without blocking the pull request. The default rate limit is 1,000 requests per token subject per minute; the measurement above raised that limit so it would not be the ceiling.

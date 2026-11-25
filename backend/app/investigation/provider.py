@@ -1,5 +1,8 @@
 """Small provider interface. Mock mode needs no credentials or remote model."""
+import asyncio
 import json
+import random
+import time
 from typing import Protocol
 
 import httpx
@@ -40,6 +43,40 @@ class UnavailableProvider:
         raise ConnectionError('Investigation model unavailable')
 
 
+class CircuitBreaker:
+    """Opens after repeated transport failures so a dead provider fails fast."""
+
+    def __init__(self, threshold=3, reset_seconds=30):
+        self.threshold = threshold
+        self.reset_seconds = reset_seconds
+        self.failures = 0
+        self.opened_at = 0.0
+
+    def allow(self):
+        if self.failures < self.threshold:
+            return True
+        if time.monotonic() - self.opened_at >= self.reset_seconds:
+            self.failures = 0
+            return True
+        return False
+
+    def success(self):
+        self.failures = 0
+
+    def failure(self):
+        self.failures += 1
+        if self.failures >= self.threshold:
+            self.opened_at = time.monotonic()
+
+
+openai_breaker = CircuitBreaker()
+
+
+def reset_openai_breaker():
+    openai_breaker.failures = 0
+    openai_breaker.opened_at = 0.0
+
+
 class OpenAIProvider:
     """One bounded Responses API call; evidence retrieval remains in Python."""
 
@@ -61,9 +98,17 @@ class OpenAIProvider:
         self.model = model or settings.OPENAI_MODEL
         self.client = client
 
+    async def _post(self, payload, headers):
+        if self.client is None:
+            async with httpx.AsyncClient(timeout=settings.OPENAI_TIMEOUT_SECONDS) as client:
+                return await client.post(self.API_URL, json=payload, headers=headers)
+        return await self.client.post(self.API_URL, json=payload, headers=headers)
+
     async def recommend(self, transaction, score, triage, evidence):
         if not self.api_key:
             raise ConnectionError('Investigation model credential unavailable')
+        if not openai_breaker.allow():
+            raise ConnectionError('Investigation model circuit open')
         # Send only fields needed for this decision, never the complete transaction/profile.
         evidence_aliases = {f'E{i + 1}': item.evidence_id for i, item in enumerate(evidence.items)}
         case_input = {
@@ -87,17 +132,27 @@ class OpenAIProvider:
             'text': {'format': {'type': 'json_schema', 'name': 'fraud_investigation',
                                 'strict': True, 'schema': self.OUTPUT_SCHEMA}},
         }
-        try:
-            if self.client is None:
-                async with httpx.AsyncClient(timeout=settings.OPENAI_TIMEOUT_SECONDS) as client:
-                    response = await client.post(self.API_URL, json=payload,
-                                                 headers={'Authorization': f'Bearer {self.api_key}'})
-            else:
-                response = await self.client.post(self.API_URL, json=payload,
-                                                  headers={'Authorization': f'Bearer {self.api_key}'})
-            response.raise_for_status()
-        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-            raise ConnectionError('Investigation model request unavailable') from exc
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        response = None
+        for attempt in range(3):
+            try:
+                response = await self._post(payload, headers)
+            except httpx.RequestError as exc:
+                openai_breaker.failure()
+                raise ConnectionError('Investigation model request unavailable') from exc
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 2:
+                    await asyncio.sleep(random.uniform(0.01, 0.05))
+                    continue
+                openai_breaker.failure()
+                raise ConnectionError('Investigation model request unavailable')
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                openai_breaker.failure()
+                raise ConnectionError('Investigation model request unavailable') from exc
+            openai_breaker.success()
+            break
         body = response.json()
         if body.get('status') != 'completed':
             raise ConnectionError('Investigation model did not complete')

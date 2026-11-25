@@ -1,0 +1,63 @@
+# Informational only. A slow or failed run does not block the pull request.
+name: load-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  locust:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fraud_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fraud_platform"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/fraud_platform
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET: ci-load-test-secret-not-a-placeholder
+      RATE_LIMIT_REQUESTS: "1000000"
+      MODEL_PATH: /tmp/fraud-ci-model
+      LOG_LEVEL: WARNING
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install API dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Publish a verified demo model
+        working-directory: backend
+        run: python -c "from app.ml.artifacts import publish_demo_model; publish_demo_model('/tmp/fraud-ci-model')"
+      - name: Start the API
+        working-directory: backend
+        run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            curl -sf http://127.0.0.1:8000/health/ready && exit 0
+            sleep 2
+          done
+          echo "API did not become ready" >&2
+          exit 1
+      - name: Short Locust sample
+        working-directory: load-tests
+        run: locust -f locustfile.py --headless -u 10 -r 5 -t 15s --host http://127.0.0.1:8000

@@ -4,13 +4,20 @@ import { ShieldCheck, AlertTriangle, RefreshCw } from 'lucide-react'
 const actions = ['APPROVE', 'BLOCK', 'REQUEST_VERIFICATION', 'ESCALATE_FOR_REVIEW']
 const initial = { transaction_id: '', user_id: '', amount: '', merchant_category: '', country: '', device_id: '' }
 
+const token = import.meta.env.VITE_API_TOKEN || ''
+
 async function api(path, method = 'GET', body) {
+  const headers = {}
+  if (body) headers['Content-Type'] = 'application/json'
+  if (token) headers.Authorization = `Bearer ${token}`
   const response = await fetch(`/api/v1${path}`, {
-    method, headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
+    method, headers, body: body ? JSON.stringify(body) : undefined,
   })
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `API request failed (${response.status})`)
+  if (!response.ok) {
+    if (response.status === 401) throw new Error('Not authenticated. Set VITE_API_TOKEN to an admin bearer token.')
+    throw new Error(typeof data.detail === 'string' ? data.detail : `API request failed (${response.status})`)
+  }
   return data
 }
 
@@ -20,7 +27,6 @@ export default function InvestigationDashboard() {
   const [caseData, setCaseData] = useState(null)
   const [reviewCases, setReviewCases] = useState([])
   const [providerStatus, setProviderStatus] = useState(null)
-  const [reviewer, setReviewer] = useState('')
   const [finalAction, setFinalAction] = useState('REQUEST_VERIFICATION')
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
@@ -67,7 +73,7 @@ export default function InvestigationDashboard() {
     setBusy(true); setError('')
     try {
       const updated = await api(`/review/cases/${caseData.case_id}`, 'POST',
-        { reviewer, final_action: finalAction, note })
+        { final_action: finalAction, note })
       setCaseData(updated)
       await refreshQueue()
     } catch (failure) { setError(failure.message) }
@@ -121,7 +127,7 @@ export default function InvestigationDashboard() {
           </div>}
           {caseData?.status === 'REVIEW_REQUIRED' && <form onSubmit={review} className="space-y-2 border-t border-slate-700 pt-4 text-sm">
             <h3 className="font-semibold">Complete human review</h3>
-            <input className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" placeholder="Reviewer name" required value={reviewer} onChange={event => setReviewer(event.target.value)} />
+            <p className="text-slate-400">The reviewer name is the subject of the signed-in token.</p>
             <select className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" value={finalAction} onChange={event => setFinalAction(event.target.value)}>{actions.map(action => <option key={action}>{action}</option>)}</select>
             <input className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" placeholder="Reason for final action" required value={note} onChange={event => setNote(event.target.value)} />
             <button disabled={busy} className="rounded-lg bg-emerald-500 px-4 py-2 font-semibold text-slate-950 disabled:opacity-40">Save review</button>

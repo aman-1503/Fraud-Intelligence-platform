@@ -62,7 +62,9 @@ class Settings(BaseSettings):
     
     # Security
     API_KEY_HEADER: str = "X-API-Key"
-    JWT_SECRET: str = "your-secret-key-change-in-production"
+    # Empty until the process environment supplies a real secret. Placeholder
+    # strings are rejected at startup.
+    JWT_SECRET: str = ""
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_HOURS: int = 24
     
