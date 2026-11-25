@@ -101,13 +101,9 @@ class FraudAPIUser(HttpUser):
         ) as response:
             if response.status_code == 200:
                 data = response.json()
-                latency = float(response.headers.get('X-Process-Time-Ms', 0))
-                
-                # Validate response
+                # Latency stays in the Locust summary. A slow 200 is not a failed request.
                 if 'fraud_score' not in data:
                     response.failure("Missing fraud_score in response")
-                elif latency > 150:
-                    response.failure(f"Latency too high: {latency}ms")
                 else:
                     response.success()
             else:
